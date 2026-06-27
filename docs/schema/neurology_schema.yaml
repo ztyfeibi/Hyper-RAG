@@ -1,0 +1,117 @@
+domain: neurology
+version: neurology_schema_v1
+
+entity_types:
+  DISEASE:
+    description: A named neurological or medical disease/disorder.
+    examples: ["Alzheimer disease", "stroke", "multiple sclerosis", "autoimmune encephalitis"]
+    aliases: ["disorder", "illness", "condition", "syndrome", "disease spectrum"]
+  SYMPTOM:
+    description: Subjective patient-reported abnormal experience.
+    examples: ["headache", "dizziness", "memory loss", "vertigo", "pain"]
+    aliases: ["complaint", "subjective symptom", "patient-reported symptom"]
+  SIGN:
+    description: Objective clinical finding observed or measured by clinicians.
+    examples: ["tremor", "Babinski sign", "nystagmus", "generalized seizure"]
+    aliases: ["clinical sign", "physical sign", "objective finding", "clinical finding"]
+  DRUG:
+    description: A medication or chemical therapeutic agent.
+    examples: ["levodopa", "aspirin", "dopamine agonist", "clonazepam", "corticosteroid"]
+    aliases: ["medicine", "medication", "pharmacologic agent", "drug class"]
+  TREATMENT:
+    description: A therapeutic intervention, procedure, or management strategy.
+    examples: ["surgery", "rehabilitation", "deep brain stimulation", "resection", "craniotomy"]
+    aliases: ["therapy", "management", "intervention", "procedure", "therapeutic strategy"]
+  EXAMINATION:
+    description: A diagnostic test, imaging, lab, or clinical examination.
+    examples: ["MRI", "EEG", "lumbar puncture", "spinal fluid analysis", "ultrasound examination"]
+    aliases: ["test", "scan", "imaging", "clinical examination", "laboratory test", "diagnostic procedure"]
+  ANATOMICAL_STRUCTURE:
+    description: A body, nervous system, brain, nerve, or tissue structure.
+    examples: ["basal ganglia", "cortex", "spinal cord", "left ovary"]
+    aliases: ["brain region", "nerve structure", "tissue", "organ", "body structure"]
+  PHYSIOLOGICAL_FUNCTION:
+    description: Normal biological or neurological function.
+    examples: ["memory", "motor control", "consciousness", "gait", "vision"]
+    aliases: ["function", "normal function", "neurological function", "biological function"]
+  PATHOLOGICAL_MECHANISM:
+    description: Disease mechanism or abnormal biological process.
+    examples: ["demyelination", "ischemia", "neurodegeneration", "inflammation"]
+    aliases: ["pathogenesis", "mechanism", "disease process", "pathological process"]
+  GENE:
+    description: A gene or genetic locus.
+    examples: ["APOE", "HTT"]
+    aliases: ["genetic locus", "gene locus"]
+  PROTEIN:
+    description: A protein or molecular product.
+    examples: ["tau", "amyloid beta", "anti-NMDA receptor antibody"]
+    aliases: ["peptide", "molecular product", "antibody", "receptor antibody"]
+  PATHWAY:
+    description: Biological, molecular, or signaling pathway.
+    examples: ["dopamine pathway", "inflammatory pathway"]
+    aliases: ["signaling pathway", "biological pathway", "molecular pathway"]
+  RISK_FACTOR:
+    description: A factor that increases disease likelihood or severity.
+    examples: ["age", "hypertension", "family history"]
+    aliases: ["predisposing factor", "risk", "risk factor", "predisposition"]
+  DIAGNOSTIC_CRITERION:
+    description: A named criterion, threshold, or diagnostic rule.
+    examples: ["diagnostic criteria", "clinical criteria"]
+    aliases: ["criterion", "criteria", "diagnostic rule", "threshold"]
+  OTHER:
+    description: Fallback type when no schema type fits.
+    examples: []
+    aliases: ["unknown", "misc", "other"]
+
+relation_types:
+  CAUSES:
+    description: One entity directly causes another.
+    aliases: ["causal", "leads_to", "results_in"]
+  ASSOCIATED_WITH:
+    description: General association without clear direction or causality.
+    aliases: ["associated", "related_to", "linked_to"]
+  INDICATES:
+    description: One finding suggests or points to another.
+    aliases: ["suggests", "points_to", "marker_of"]
+  DIAGNOSES:
+    description: One test, criterion, or process is used to diagnose another.
+    aliases: ["diagnostic", "confirms", "used_to_diagnose"]
+  TREATS:
+    description: One drug or treatment improves or manages another entity.
+    aliases: ["treatment", "therapy", "therapeutic"]
+  PREVENTS:
+    description: One intervention reduces likelihood of another.
+    aliases: ["prevention", "protects_against"]
+  COMPLICATES:
+    description: One disease/event worsens, complicates, or is a complication of another.
+    aliases: ["complication", "worsens"]
+  LOCATED_IN:
+    description: One entity is anatomically located in another.
+    aliases: ["located", "site_of", "localizes_to"]
+  AFFECTS:
+    description: One entity changes or impacts another.
+    aliases: ["impacts", "influences", "changes"]
+  REGULATES:
+    description: One entity modulates or controls another biological process.
+    aliases: ["modulates", "controls"]
+  PART_OF:
+    description: One entity is a component of another.
+    aliases: ["component_of", "belongs_to"]
+  INTERACTS_WITH:
+    description: Two drugs, proteins, pathways, or entities interact.
+    aliases: ["interaction", "interacts"]
+  MECHANISM_OF:
+    description: One mechanism explains another entity.
+    aliases: ["pathogenesis_of", "explains", "underlies"]
+  RISK_FACTOR_FOR:
+    description: One entity increases risk of another.
+    aliases: ["risk", "predisposes_to"]
+  DIFFERENTIAL_DIAGNOSIS:
+    description: Diseases or syndromes that must be distinguished.
+    aliases: ["differential", "distinguish_from"]
+  CO_OCCURS_WITH:
+    description: Entities appear together without a stronger relation.
+    aliases: ["co_occurs", "coexists_with"]
+  OTHER:
+    description: Fallback relation type.
+    aliases: ["unknown", "misc"]
