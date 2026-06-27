@@ -1,262 +1,107 @@
-<!-- <div align="center" id="top"> 
-  <img src="./assets/hg.svg" alt="Hypergraph" width="100%" />
-</div> -->
-
-<h1 align="center">Hyper-RAG</h1>
-
-<p align="center">
-  <img alt="Github top language" src="https://img.shields.io/github/languages/top/iMoonLab/Hyper-RAG?color=purple">
-
-  <img alt="Github language count" src="https://img.shields.io/github/languages/count/iMoonLab/Hyper-RAG?color=purple">
-
-  <img alt="Repository size" src="https://img.shields.io/github/repo-size/iMoonLab/Hyper-RAG?color=purple">
-
-  <img alt="License" src="https://img.shields.io/github/license/iMoonLab/Hyper-RAG?color=purple">
-  <a href="https://www.nature.com/articles/s41467-026-71411-1"><img alt="Nature Communications" src="https://img.shields.io/badge/Nature%20Communications-2026-E63946?logo=nature&logoColor=white"></a>
-  <a href="https://doi.org/10.1038/s41467-026-71411-1"><img alt="DOI" src="https://img.shields.io/badge/DOI-10.1038%2Fs41467--026--71411--1-1F6FEB"></a>
-</p>
-
-<p align="center">
-  <a href="#dart-about">About</a> &#xa0; | &#xa0; 
-  <a href="#sparkles-why-hyper-rag-is-more-powerful">Features</a> &#xa0; | &#xa0;
-  <a href="#rocket-installation">Installation</a> &#xa0; | &#xa0;
-  <a href="#white_check_mark-quick-start">Quick Start</a> &#xa0; | &#xa0;
-  <a href="#whale-docker-deployment">Docker</a> &#xa0; | &#xa0;
-  <a href="#checkered_flag-evaluation">Evaluation</a> &#xa0; | &#xa0;
-  <a href="#memo-license">License</a> &#xa0; | &#xa0;
-  <a href="https://github.com/yifanfeng97" target="_blank">Author</a>
-</p>
-
-<br>
-
-
-<div align="center">
-  <img src="./assets/many_llms_all.svg" alt="Overall Performance" width="100%" />
-</div>
-
-We show that Hyper-RAG is a powerful RAG that can enhance the performance of various LLMs and outperform other SOTA RAG methods in the NeurologyCorp dataset. **Our paper has been published in <a href="https://www.nature.com/articles/s41467-026-71411-1"><i>Nature Communications</i></a> (2026)**.
-
-## :dart: About
-
-<details>
-<summary> <b>Abstract</b> </summary>
-Large language models (LLMs) have transformed various sectors, including education, finance, and medicine, by enhancing content generation and decision-making processes. However, their integration into the medical field is cautious due to hallucinations, instances where generated content deviates from factual accuracy, potentially leading to adverse outcomes. To address this, we introduce Hyper-RAG, a hypergraph-driven Retrieval-Augmented Generation method that comprehensively captures both pairwise and beyond-pairwise correlations in domain-specific knowledge, thereby mitigating hallucinations. Experiments on the NeurologyCrop dataset with six prominent LLMs demonstrated that Hyper-RAG improves accuracy by an average of 12.3% over direct LLM use and outperforms Graph RAG and Light RAG by 6.3% and 6.0%, respectively. Additionally, Hyper-RAG maintained stable performance with increasing query complexity, unlike existing methods which declined. Further validation across nine diverse datasets showed a 35.5% performance improvement over Light RAG using a selection-based assessment. The lightweight variant, Hyper-RAG-Lite, achieved twice the retrieval speed and a 3.3\% performance boost compared with Light RAG. These results confirm Hyper-RAG's effectiveness in enhancing LLM reliability and reducing hallucinations, making it a robust solution for high-stakes applications like medical diagnostics.
-</details>
-
-<br>
-
-<div align="center">
-  <img src="./assets/fw.svg" alt="Framework" width="100%" />
-</div>
-Schematic diagram of the proposed Hyper-RAG architecture. a, The patient poses a question. b, A knowledge base is constructed from relevant domainspecific corpora. c, Responses are generated directly using LLMs. d, Hyper-RAG generates responses by first retrieving relevant prior knowledge from the knowledge base and then inputting this knowledge, along with the patient’s question, into the LLMs to formulate the reply.
-
-<br>
-<br>
-
-<details>
-<summary> <b>More details about hypergraph modeling</b> </summary>
-<div align="center"> 
-  <img src="./assets/hg.svg" alt="Hypergraph" width="100%" />
-Example of hypergraph modeling for entity space. Hypergraph can model the beyond-pairwise relationship among entities, which is more powerful than the pairwise relationship in traditional graph modeling. With hypergraphs, we can avoid the information loss caused by the pairwise relationship.
-</div>
-<br>
-<div align="center"> 
-  <img src="./assets/extract.svg" alt="Extract Hypergraph" width="100%" />
-  Illustration of Entity and Correlation Extraction from Raw Corpus: Dark brown boxes represent entities, blue arrows denote low-order correlations between entities, and red arrows indicate high-order correlations. Yellow boxes contain the original descriptions of the respective entities or their correlations.
-</div>
-</details>
-
-<br>
-
-## :sparkles: Why Hyper-RAG is More Powerful
-
-:heavy_check_mark: **Comprehensive Relationship Modeling with Hypergraphs**: Utilizes hypergraphs to thoroughly model the associations within the raw corpus data, providing more complex relationships compared to traditional graph-based data organization.;\
-:heavy_check_mark: **Native Hypergraph-DB Integration**: Employs the native hypergraph database, <a href="https://github.com/iMoonLab/Hypergraph-DB">Hypergraph-DB</a>, as the foundation, supporting rapid retrieval of higher-order associations.;\
-:heavy_check_mark: **Superior Performance**: Hyper-RAG outperforms Graph RAG and Light RAG by 6.3% and 6.0% respectively.;\
-:heavy_check_mark: **Broad Validation**: Across nine diverse datasets, Hyper-RAG shows a 35.5% performance improvement over Light RAG based on a selection-based assessment.;\
-:heavy_check_mark: **Efficiency**: The lightweight variant, Hyper-RAG-Lite, achieves twice the retrieval speed and a 3.3% performance boost compared to Light RAG.;
-
-## :rocket: Installation
-
-
-```bash
-# Clone this project
-git clone https://github.com/iMoonLab/Hyper-RAG.git
-
-# Access
-cd Hyper-RAG
-
-# Install dependencies
-pip install -r requirements.txt
-```
-
-## :white_check_mark: Quick Start
-
-### Configure your LLM API
-Copy the `config_temp.py` file to `my_config.py` in the root folder and set your LLM `URL` and `KEY`.
-
-```python
-LLM_BASE_URL = "Yours xxx"
-LLM_API_KEY = "Yours xxx"
-LLM_MODEL = "gpt-4o-mini"
-
-EMB_BASE_URL = "Yours xxx"
-EMB_API_KEY = "Yours xxx"
-EMB_MODEL = "text-embedding-3-small"
-EMB_DIM = 1536
-```
-
-### Run the toy example
-
-```bash
-python examples/hyperrag_demo.py
-```
-
-### Or Run by Steps
-
-1. Prepare the data. You can download the dataset from Google Drive <a href="https://drive.google.com/drive/folders/1JxXXUR4Jx-2IKn4VGpDeH4xb4-nYEWBx?usp=sharing">here</a>, or Baidu Cloud <a href="https://pan.baidu.com/s/1mrDJVpMW59gLtRRSXafXdw?pwd=w642">here</a>. Put the dataset in the root direction. Then run the following command to preprocess the data.
-
-```bash
-python reproduce/Step_0.py
-```
-
-2. Build the knowledge hypergraphs, and entity and relation vector database with following command.
-
-```bash
-python reproduce/Step_1.py
-```
-
-3. Extract questions from the orignial datasets with following command.
-
-```bash
-python reproduce/Step_2_extract_question.py
-```
-
-Those questions are saved in the `cache/{{data_name}}/questions` folder. 
-
-4. Run the Hyper-RAG to response those questions with following command.
-
-```bash
-python reproduce/Step_3_response_question.py
-```
-
-Those response are saved in the `cache/{{data_name}}/response` folder.
-
-You can also change the `mode` parameter to `hyper` or `hyper-lite` to run the Hyper-RAG or Hyper-RAG-Lite.
-
-
-### Hypergraph Visualization
-We provide a web-based visualization tool for hypergraphs and lightweight Hyper-RAG QA system. For more information, please refer to [Hyper-RAG Web-UI](./web-ui/README.md).
-
-*Note: We welcome any contributions to improve it.*
-![vis-qa](./assets/vis-QA.png)
-![vis-hg](./assets/vis-hg.png)
-
-## :whale: Docker Deployment
-
-We provide Docker support for easy deployment of the Hyper-RAG Web UI. Docker deployment includes both frontend and backend services with optional Nginx reverse proxy.
-
-### Quick Start with Docker
-
-1. **Prerequisites**: Ensure Docker and Docker Compose are installed on your system.
-
-2. **Navigate to web-ui directory**:
-```bash
-cd web-ui
-```
-
-3. **Start with Docker Compose**:
-```bash
-docker-compose up 
-```
-
-4. **Access the application**:
-   - Application at http://localhost:5000
-
-### Detailed Documentation
-
-For comprehensive Docker deployment instructions, configuration options, troubleshooting, and production deployment guidelines, please refer to our detailed [Docker Deployment Guide](./web-ui/DOCKER.md).
-
-## :bulb: Simple Test Demo
-
-1. Run by steps
-```bash
-conda activate rag
-cd Hyper_RAG/reproduce
-python reproduce/Step_0.py
-python reproduce/Step_1.py
-
-cd Hyper-RAG
-python -m uvicorn service_api:app --app-dir . --host 0.0.0.0 --port 8000
-```
-2. Open `testHTML_light.html` in your web browser.
-3. Selecting the model (`hyper`,`hyper-lite`,`naive`) and whether to output in streaming mode
-
-<div align="center">
-  <img src="./assets/hyperrag-streaming.gif" alt="Efficiency analysis" width="80%" />
-</div>
-
-## :checkered_flag: Evaluation
-In this work, we propose two evaluation strategys: the **selection-based** and **scoring-based** evaluation. 
-
-### Scoring-based evaluation
-Scoring-Based Assessment is designed to facilitate the comparative evaluation of multiple model outputs by quantifying their performance across various dimensions. This approach allows for a nuanced assessment of model capabilities by providing scores on several key metrics. However, a notable limitation is its reliance on reference answers. In our preprocessing steps, we leverage the source chunks from which each question is derived as reference answers.
-
-You can use the following command to use this evaluation method.
-
-```bash
-python evaluate/evaluate_by_scoring.py
-```
-The results of this evaluation are shown in the following figure.
-<div align="center">
-  <img src="./assets/many_llms_sp.svg" alt="Scoring-based evaluation" width="90%" />
-</div>
-
-
-### Selection-based evaluation
-Selection-Based Assessment is tailored for scenarios where preliminary candidate models are available, enabling a comparative evaluation through a binary choice mechanism. This method does not require reference answers, making it suitable for diverse and open-ended questions. However, its limitation lies in its comparative nature, as it only allows for the evaluation of two models at a time.
-
-You can use the following command to use this evaluation method.
-
-```bash
-python evaluate/evaluate_by_selection.py
-```
-The results of this evaluation are shown in the following figure.
-<div align="center">
-  <img src="./assets/multi_domain.svg" alt="Selection-based evaluation" width="90%" />
-</div>
-
-
-### Efficiency Analysis
-We conducted an efficiency analysis of our Hyper-RAG method using GPT-4o mini on the NeurologyCrop dataset, comparing it with standard RAG, Graph RAG, and Light RAG. To ensure fairness by excluding network latency, we measured only the local retrieval time for relevant knowledge and the construction of the prior knowledge prompt. While standard RAG focuses on the direct retrieval of chunk embeddings, Graph RAG, Light RAG, and Hyper-RAG also include retrieval from node and correlation vector databases and the time for one layer of graph or hypergraph information diffusion. We averaged the response times over 50 questions from the dataset for each method. The results are shown in the following figure.
-
-<div align="center">
-  <img src="./assets/speed_all.svg" alt="Efficiency analysis" width="60%" />
-</div>
-
-## :memo: License
-
-This project is under license from Apache 2.0. For more details, see the [LICENSE](LICENSE.md) file.
-
-Hyper-RAG is maintained by [iMoon-Lab](http://moon-lab.tech/), Tsinghua University. 
-Made with :heart: by <a href="https://github.com/yifanfeng97" target="_blank">Yifan Feng</a>, <a href="https://github.com/haoohu" target="_blank">Hao Hu</a>, <a href="https://github.com/yifanfeng97" target="_blank">Xingliang Hou</a>, <a href="https://github.com/yifanfeng97" target="_blank">Shiquan Liu</a>, <a href="https://github.com/FuYou0723" target="_blank">Yifan Zhang</a>, <a href="https://github.com/yuxizhe" target="_blank">Xizhe Yu</a>. 
-
-If you have any questions, please feel free to contact us via email: [Yifan Feng](mailto:evanfeng97@gmail.com). 
-
-This repo benefits from [LightRAG](https://github.com/HKUDS/LightRAG) and [Hypergraph-DB](https://github.com/iMoonLab/Hypergraph-DB).  Thanks for their wonderful works.
-
-&#xa0;
-
-## 🌟Citation
-```
-@article{feng2026hyperrag,
-      title   = {Hyper-RAG: combating LLM hallucinations using hypergraph-driven retrieval-augmented generation},
-      author  = {Feng, Yifan and Hu, Hao and Ying, Shihui and Hou, Xingliang and Liu, Shiquan and Yang, Mingyuan and Li, Junchang and Du, Shaoyi and Zheng, Nanning and Hu, Han and Gao, Yue},
-      journal = {Nature Communications},
-      year    = {2026},
-      doi     = {10.1038/s41467-026-71411-1},
-      url     = {https://www.nature.com/articles/s41467-026-71411-1}
-}
-```
-
-<a href="#top">Back to top</a>
+3. 计划
+3.1 总目标
+在原始 Hyper-RAG 的基础上，做一个 Query-Adaptive Domain-Aware Hyper-RAG。
+核心思想是：原 Hyper-RAG 已经证明“高阶关系有用”，但它对不同问题基本采用固定检索和扩散策略。我们的改进目标是让系统先理解 Query 类型，再结合领域实体类型和超图结构，动态决定检索范围、扩散深度和超边权重，从而在复杂问题上提升召回与答案完整性，在简单问题上减少噪声和检索成本。
+
+---
+模块 1：领域类型增强索引
+作用：让知识库从“普通实体/关系集合”升级为“带领域类型的异构超图”。
+大致思想：
+在建库阶段，LLM 抽取实体和关系时，不只抽实体名、描述、关系描述，还额外抽取实体类型和关系类型。例如医学场景中，实体可以分为疾病、症状、药物、检查、解剖结构、治疗方案、机制等。
+实体和关系写入向量库时，不再只使用短名称或简单描述做 embedding，而是把类型、描述、参与实体等信息一起拼入语义表示。
+目标是增强短实体名和短关系描述的语义辨识度，让后续检索更稳定，也为 Query 阶段的类型感知过滤和加权提供基础。
+
+---
+模块 2：Query 感知路由器
+作用：让系统先判断“这个问题应该怎么检索”。
+大致思想：
+在查询进入 Hyper-RAG 前，增加一个轻量 Query Router。它负责识别当前问题的复杂度、问题类型和目标实体类型。
+输出可以包括：
+complexity: simple / complex
+query_type: fact / mechanism / causal / comparison / multi-hop
+target_entity_types: disease / symptom / drug / examination / mechanism ...
+这个模块不直接回答问题，只负责给后续检索策略提供控制信号。
+Simple 问题通常只需要少量实体和直接证据。Complex 问题通常需要更多关系、更多高阶超边和更深的拓扑扩散。
+第一阶段不建议把重点放在微调分类模型上，可以先用 LLM prompt 或规则实现稳定标签，后续再考虑蒸馏成小模型。
+
+---
+模块 3：类型感知检索增强
+作用：让实体检索和关系检索不只看语义相似度，还看领域类型是否匹配。
+大致思想：
+原始 Hyper-RAG 中：
+low_level_keywords -> 检索实体向量库
+high_level_keywords -> 检索关系向量库
+改进后，检索结果不仅根据 embedding 相似度排序，还结合 Query Router 输出的目标实体类型进行加权。
+匹配目标类型的实体或关系获得更高权重，不匹配的结果降低权重。为了避免分类错误导致漏召回，第一版建议使用 soft filter，也就是加权而不是直接删除。
+目标是减少无关医学实体和泛化关系进入后续超图扩散阶段。
+
+---
+模块 4：自适应超图拓扑扩散
+作用：这是核心创新模块，让超图扩散策略根据问题动态变化。
+大致思想：
+对于 Simple Query，系统采用低成本检索策略：降低 top-k，减少关系扩展，只保留直接相连的实体、超边和 source chunk。
+对于 Complex Query，系统采用高阶检索策略：增加实体和关系 top-k，允许从 1-hop 扩展到 2-hop，并优先保留更可能表达多实体共同作用的高阶超边。
+扩散过程中不平等对待所有超边，而是给超边计算综合权重。重要因素包括：
+语义相似度
+Query 实体覆盖率
+实体类型匹配程度
+超边阶数
+节点或超边 degree
+扩散 hop 距离
+核心规则是：如果某条超边同时覆盖了 Query 中多个关键实体，它更可能是回答复杂问题的关键关系，应当被优先保留。
+
+---
+模块 5：质量感知超边排序
+作用：控制高阶关系噪声，避免“扩散越多越乱”。
+大致思想：
+高阶超边虽然信息密度高，但也可能带来抽取错误或过宽泛关系。因此需要对候选超边进行质量排序。
+可以从几个角度估计超边质量：
+是否来自多个 source chunk
+是否覆盖多个 query entities
+是否包含目标实体类型
+是否与 high-level keywords 相似
+degree 是否过高
+是否是一条过泛化关系
+这个模块的目标不是构造更多超边，而是从已有超边里选出更可靠、更贴近当前问题的部分。
+
+---
+模块 6：结构化证据上下文组装
+作用：让 LLM 更容易使用检索结果，而不是被一堆杂乱 chunk 干扰。
+大致思想：
+最终上下文不再只是简单拼接 Entities、Relationships、Sources，而是按照证据角色组织：
+Direct Evidence：直接相关原文 chunk
+Key Entities：关键实体
+High-order Relations：高阶关系证据
+Supporting Sources：补充来源
+对于 Complex Query，可以突出显示覆盖多个查询实体的高阶关系。对于 Simple Query，可以减少关系描述，更多保留直接原文证据。
+目标是提高 LLM 对检索上下文的利用效率，减少无关信息导致的回答漂移。
+
+---
+模块 7：实验与消融设计
+作用：证明每个模块确实有效，而不是堆功能。
+大致思想：
+主线对比：
+Naive RAG
+Original Hyper-RAG
+Type-aware Indexing
+Query-aware Retrieval
+Adaptive Diffusion
+Full Method
+重点观察：
+答案质量是否提升
+复杂问题上是否提升更明显
+简单问题上检索时间是否下降
+无关 chunk 是否减少
+高阶超边命中率是否提高
+source chunk 命中率是否提高
+实验不只看最终回答分数，还要看检索阶段的中间指标。这样论文里可以解释“为什么有效”。
+
+---
+最终方法定位
+这个方案不是推翻 Hyper-RAG，而是对 Hyper-RAG 做查询自适应增强。
+可以这样概括：
+原 Hyper-RAG：固定地利用实体检索、关系检索和超图扩散增强 RAG。
+
+改进方法：先理解 Query，再根据问题复杂度、目标实体类型和超边质量，自适应选择检索范围、扩散深度和证据上下文。
+最核心的论文贡献可以写成：
+我们提出一种 Query-Adaptive Domain-Aware Hyper-RAG 方法，通过领域类型增强索引、查询感知路由和质量感知超图扩散，使 Hyper-RAG 能够根据问题复杂度动态调节高阶关系检索策略，从而在复杂领域问答中提升知识召回、降低噪声并减少幻觉。
