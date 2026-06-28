@@ -78,3 +78,108 @@ Phase 1 only defines the schema artifacts. Runtime extraction, query, storage, a
 - Use PREVENTS only for preventive effect before onset or recurrence, not ordinary treatment after disease onset.
 - Use LOCATED_IN for anatomical site relations and PART_OF for component/whole relations.
 - Use CO_OCCURS_WITH for clinical constellations or reference-list co-mentions that lack a stronger stated relation.
+
+## Allowed Patterns
+
+Allowed patterns define medically plausible type combinations for relation labels. They are not strict database constraints in phase 1. Later phases can use them for `schema_validity` and soft ranking.
+
+- `valid`: entity types and relation type match a known pattern.
+- `weak_valid`: entity and relation types are known, but the exact pattern is not listed.
+- `invalid`: unknown type or clearly implausible pattern.
+
+Phase 1 policy: do not hard-delete weak or invalid edges. Mark them for later weighting.
+
+## High-Order Hyperedge Rules
+
+A high-order hyperedge should connect at least three entities and express a shared medical pattern, mechanism, diagnostic constellation, treatment strategy, comorbidity pattern, or pathway process.
+
+Do not create high-order hyperedges by simply grouping every entity in the same chunk. A valid high-order hyperedge needs a meaningful shared relation.
+
+Preferred patterns:
+
+- DISEASE + SYMPTOM + SIGN
+- DISEASE + EXAMINATION + DIAGNOSTIC_CRITERION
+- DISEASE + DRUG + TREATMENT
+- DISEASE + PATHOLOGICAL_MECHANISM + ANATOMICAL_STRUCTURE
+- GENE + PROTEIN + PATHWAY + DISEASE
+
+High-order relation labels:
+
+- MULTI_FACTOR_MECHANISM: multiple entities jointly describe a disease mechanism.
+- CLINICAL_SYNDROME: multiple symptoms or signs jointly describe a clinical syndrome.
+- DIAGNOSTIC_PATTERN: multiple findings, tests, or criteria jointly support diagnosis.
+- THERAPEUTIC_STRATEGY: multiple treatments, drugs, or management factors form a treatment strategy.
+- COMORBIDITY_PATTERN: multiple diseases or risk factors form a comorbidity pattern.
+- PATHWAY_PROCESS: multiple genes, proteins, pathways, or mechanisms form a biological process.
+- DIFFERENTIAL_GROUP: multiple diseases or syndromes should be distinguished from each other.
+- OTHER: fallback high-order relation type.
+
+## Field Contract
+
+Entity fields:
+
+- `entity_name`
+- `entity_type`
+- `description`
+- `additional_properties`
+- `source_id`
+
+Hyperedge fields:
+
+- `entity_set`
+- `edge_type`
+- `description`
+- `generalization`
+- `keywords`
+- `weight`
+- `source_id`
+- `level_hg`
+- `schema_validity`
+
+Use `edge_type` consistently for relation type. Do not mix `relationship_type`, `relation_type`, and `edge_type` in code or data.
+
+## Normalization Policy
+
+LLM outputs should prefer canonical uppercase labels from this schema. If the LLM emits an alias, later parsing should normalize it to the canonical label.
+
+Examples:
+
+- disorder, illness, condition -> DISEASE
+- medication, medicine -> DRUG
+- test, scan, imaging -> EXAMINATION
+- pathogenesis, mechanism -> PATHOLOGICAL_MECHANISM
+- treatment, therapy, therapeutic -> TREATS
+- diagnostic, used_to_diagnose -> DIAGNOSES
+- suggests, marker_of -> INDICATES
+
+## Validation Policy
+
+Schema validation should be soft in the first implementation.
+
+- `valid`: entity types and edge type match an allowed pattern.
+- `weak_valid`: entity types and edge type are known, but the pattern is not listed.
+- `invalid`: unknown type or clearly implausible pattern.
+
+Recommended phase-2 behavior:
+
+- keep `valid` edges normally
+- keep `weak_valid` edges but allow slight ranking penalty
+- keep `invalid` edges as `OTHER` or apply stronger ranking penalty
+- do not hard-delete edges in the first implementation
+
+## Version
+
+- Schema version: `neurology_schema_v1`
+- Dataset: `datasets/neurology/neurology.jsonl`
+- Purpose: Domain-aware typed hypergraph indexing for Hyper-RAG.
+- Status: Frozen for phase-2 prompt and parser integration.
+
+## Phase-2 Integration Points
+
+The next phase should wire this schema into:
+
+- `hyperrag/prompt.py`: prompt type lists, relation type lists, allowed-pattern guidance, examples.
+- `hyperrag/operate.py`: edge type parsing, high-order generalization retention, schema validity field, VDB content construction.
+- `hyperrag/hyperrag.py`: VDB `meta_fields` for `entity_type` and `edge_type`.
+
+Phase 2 must rebuild the knowledge base after code integration.

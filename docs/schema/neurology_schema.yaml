@@ -115,3 +115,114 @@ relation_types:
   OTHER:
     description: Fallback relation type.
     aliases: ["unknown", "misc"]
+
+allowed_patterns:
+  CAUSES:
+    - ["PATHOLOGICAL_MECHANISM", "DISEASE"]
+    - ["DISEASE", "SIGN"]
+    - ["DISEASE", "SYMPTOM"]
+    - ["DISEASE", "PATHOLOGICAL_MECHANISM"]
+  TREATS:
+    - ["DRUG", "DISEASE"]
+    - ["DRUG", "SYMPTOM"]
+    - ["TREATMENT", "DISEASE"]
+    - ["TREATMENT", "SYMPTOM"]
+  PREVENTS:
+    - ["DRUG", "DISEASE"]
+    - ["TREATMENT", "DISEASE"]
+  DIAGNOSES:
+    - ["EXAMINATION", "DISEASE"]
+    - ["DIAGNOSTIC_CRITERION", "DISEASE"]
+  INDICATES:
+    - ["SYMPTOM", "DISEASE"]
+    - ["SIGN", "DISEASE"]
+    - ["EXAMINATION", "DISEASE"]
+  MECHANISM_OF:
+    - ["PATHOLOGICAL_MECHANISM", "DISEASE"]
+    - ["PATHWAY", "DISEASE"]
+    - ["PHYSIOLOGICAL_FUNCTION", "DISEASE"]
+  LOCATED_IN:
+    - ["DISEASE", "ANATOMICAL_STRUCTURE"]
+    - ["PATHOLOGICAL_MECHANISM", "ANATOMICAL_STRUCTURE"]
+    - ["SIGN", "ANATOMICAL_STRUCTURE"]
+  RISK_FACTOR_FOR:
+    - ["RISK_FACTOR", "DISEASE"]
+  DIFFERENTIAL_DIAGNOSIS:
+    - ["DISEASE", "DISEASE"]
+  PART_OF:
+    - ["PROTEIN", "PATHWAY"]
+    - ["ANATOMICAL_STRUCTURE", "ANATOMICAL_STRUCTURE"]
+  REGULATES:
+    - ["PROTEIN", "PATHWAY"]
+    - ["GENE", "PROTEIN"]
+    - ["PATHWAY", "PHYSIOLOGICAL_FUNCTION"]
+  INTERACTS_WITH:
+    - ["DRUG", "DRUG"]
+    - ["PROTEIN", "PROTEIN"]
+    - ["PATHWAY", "PATHWAY"]
+  COMPLICATES:
+    - ["DISEASE", "DISEASE"]
+    - ["DISEASE", "SYMPTOM"]
+    - ["TREATMENT", "DISEASE"]
+    - ["TREATMENT", "SYMPTOM"]
+  AFFECTS:
+    - ["DISEASE", "PHYSIOLOGICAL_FUNCTION"]
+    - ["PATHOLOGICAL_MECHANISM", "PHYSIOLOGICAL_FUNCTION"]
+    - ["DISEASE", "ANATOMICAL_STRUCTURE"]
+  ASSOCIATED_WITH:
+    - ["DISEASE", "DISEASE"]
+    - ["GENE", "DISEASE"]
+    - ["PROTEIN", "DISEASE"]
+    - ["SYMPTOM", "DISEASE"]
+  CO_OCCURS_WITH:
+    - ["SYMPTOM", "SYMPTOM"]
+    - ["SYMPTOM", "SIGN"]
+    - ["DISEASE", "DISEASE"]
+
+high_order_relation_types:
+  MULTI_FACTOR_MECHANISM:
+    description: Multiple entities jointly describe a disease mechanism.
+  CLINICAL_SYNDROME:
+    description: Multiple symptoms or signs jointly describe a clinical syndrome.
+  DIAGNOSTIC_PATTERN:
+    description: Multiple findings, tests, or criteria jointly support diagnosis.
+  THERAPEUTIC_STRATEGY:
+    description: Multiple treatments, drugs, or management factors form a treatment strategy.
+  COMORBIDITY_PATTERN:
+    description: Multiple diseases or risk factors form a comorbidity pattern.
+  PATHWAY_PROCESS:
+    description: Multiple genes, proteins, pathways, or mechanisms form a biological process.
+  DIFFERENTIAL_GROUP:
+    description: Multiple diseases or syndromes should be distinguished from each other.
+  OTHER:
+    description: Fallback high-order relation type.
+
+field_contract:
+  entity:
+    - entity_name
+    - entity_type
+    - description
+    - additional_properties
+    - source_id
+  hyperedge:
+    - entity_set
+    - edge_type
+    - description
+    - generalization
+    - keywords
+    - weight
+    - source_id
+    - level_hg
+    - schema_validity
+
+validation:
+  unknown_entity_type: OTHER
+  unknown_relation_type: OTHER
+  unknown_high_order_relation_type: OTHER
+  pattern_policy:
+    valid: keep
+    weak_valid: keep_with_soft_penalty
+    invalid: keep_as_other_or_penalize
+  target_thresholds:
+    max_other_ratio: 0.20
+    max_invalid_ratio: 0.10
