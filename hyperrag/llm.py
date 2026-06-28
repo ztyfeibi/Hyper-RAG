@@ -79,7 +79,9 @@ async def openai_complete_if_cache(
             return if_cache_return["return"]
 
     response = await openai_async_client.chat.completions.create(
-        model=model, messages=messages, **kwargs
+        model=model, messages=messages,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        **kwargs
     )
 
     if hashing_kv is not None:
@@ -194,7 +196,9 @@ async def azure_openai_complete_if_cache(
             return if_cache_return["return"]
 
     response = await openai_async_client.chat.completions.create(
-        model=model, messages=messages, **kwargs
+        model=model, messages=messages,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        **kwargs
     )
 
     if hashing_kv is not None:
