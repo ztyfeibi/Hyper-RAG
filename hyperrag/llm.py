@@ -363,6 +363,7 @@ async def openai_embedding(
     model: str = "text-embedding-3-small",
     base_url: str = None,
     api_key: str = None,
+    dimensions: int = None,
 ) -> np.ndarray:
     """OpenAI-compatible embedding 接口，返回 numpy 向量矩阵。"""
     if api_key:
@@ -371,9 +372,10 @@ async def openai_embedding(
     openai_async_client = (
         AsyncOpenAI() if base_url is None else AsyncOpenAI(base_url=base_url)
     )
-    response = await openai_async_client.embeddings.create(
-        model=model, input=texts, encoding_format="float"
-    )
+    kwargs = dict(model=model, input=texts, encoding_format="float")
+    if dimensions is not None:
+        kwargs["dimensions"] = dimensions
+    response = await openai_async_client.embeddings.create(**kwargs)
     return np.array([dp.embedding for dp in response.data])
 
 
