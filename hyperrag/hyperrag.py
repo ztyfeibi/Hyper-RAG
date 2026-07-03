@@ -178,13 +178,13 @@ class HyperRAG:
             namespace="entities",
             global_config=asdict(self),
             embedding_func=self.embedding_func,
-            meta_fields={"entity_name"},
+            meta_fields={"entity_name", "entity_type"},
         )
         self.relationships_vdb = self.vector_db_storage_cls(
             namespace="relationships",
             global_config=asdict(self),
             embedding_func=self.embedding_func,
-            meta_fields={"id_set"},
+            meta_fields={"id_set", "edge_type"},
         )
         # 原文 chunk 向量库：naive RAG 模式会直接查它。
         self.chunks_vdb = self.vector_db_storage_cls(
