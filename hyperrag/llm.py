@@ -44,8 +44,8 @@ normalize_proxy_env()
 
 
 @retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=2, min=10, max=60),
     retry=retry_if_exception_type((RateLimitError, APIConnectionError, Timeout)),
 )
 async def openai_complete_if_cache(
@@ -80,7 +80,7 @@ async def openai_complete_if_cache(
 
     response = await openai_async_client.chat.completions.create(
         model=model, messages=messages,
-        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        extra_body={"enable_thinking": False},
         **kwargs
     )
 
@@ -157,8 +157,8 @@ async def openai_complete_stream_if_cache(
         await hashing_kv.upsert({args_hash: {"return": text, "model": model}})
 
 @retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=2, min=10, max=60),
     retry=retry_if_exception_type((RateLimitError, APIConnectionError, Timeout)),
 )
 async def azure_openai_complete_if_cache(
@@ -197,7 +197,7 @@ async def azure_openai_complete_if_cache(
 
     response = await openai_async_client.chat.completions.create(
         model=model, messages=messages,
-        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        extra_body={"enable_thinking": False},
         **kwargs
     )
 
@@ -354,8 +354,8 @@ async def bedrock_complete(
 
 @wrap_embedding_func_with_attrs(embedding_dim=1536, max_token_size=8192)
 @retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=60),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=2, min=10, max=60),
     retry=retry_if_exception_type((RateLimitError, APIConnectionError, Timeout)),
 )
 async def openai_embedding(
@@ -381,8 +381,8 @@ async def openai_embedding(
 
 @wrap_embedding_func_with_attrs(embedding_dim=1536, max_token_size=8192)
 @retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=2, min=10, max=60),
     retry=retry_if_exception_type((RateLimitError, APIConnectionError, Timeout)),
 )
 async def azure_openai_embedding(
@@ -410,8 +410,8 @@ async def azure_openai_embedding(
 
 
 @retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=60),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=2, min=10, max=60),
     retry=retry_if_exception_type((RateLimitError, APIConnectionError, Timeout)),
 )
 async def siliconcloud_embedding(

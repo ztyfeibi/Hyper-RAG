@@ -95,18 +95,35 @@ class NanoVectorDBStorage(BaseVectorStorage):
 
     async def upsert(self, data: dict[str, dict]):
         """把数据的 content 字段 embedding 后写入向量库。"""
-        logger.info(f"Inserting {len(data)} vectors to {self.namespace}")
         if not len(data):
             logger.warning("You insert an empty data to vector DB")
             return []
+        
+        # 检查哪些ID已存在，跳过已有的embedding
+        existing_ids = set()
+        storage = self._client._NanoVectorDB__storage
+        for item in storage.get("data", []):
+            existing_ids.add(item.get("__id__"))
+        
+        new_data = {k: v for k, v in data.items() if k not in existing_ids}
+        skipped = len(data) - len(new_data)
+        
+        if skipped > 0:
+            logger.info(f"Skipping {skipped} existing vectors in {self.namespace}")
+        
+        if not new_data:
+            logger.info(f"All {len(data)} vectors already exist in {self.namespace}")
+            return []
+        
+        logger.info(f"Inserting {len(new_data)} new vectors to {self.namespace}")
         list_data = [
             {
                 "__id__": k,
                 **{k1: v1 for k1, v1 in v.items() if k1 in self.meta_fields},
             }
-            for k, v in data.items()
+            for k, v in new_data.items()
         ]
-        contents = [v["content"] for v in data.values()]
+        contents = [v["content"] for v in new_data.values()]
         batches = [
             contents[i : i + self._max_batch_size]
             for i in range(0, len(contents), self._max_batch_size)

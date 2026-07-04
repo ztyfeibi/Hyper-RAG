@@ -3,6 +3,7 @@
 import asyncio
 import re
 import sys
+import time
 from collections import defaultdict
 from datetime import datetime
 
@@ -78,7 +79,22 @@ async def extract_entities(
         content = chunk_dp["content"]
         hint_prompt = entity_extract_prompt.format(**context_base, input_text=content)
 
-        final_result = await use_llm_func(hint_prompt)
+        # Chunk级别重试：最多重试3次
+        max_chunk_retries = 3
+        final_result = None
+        for retryAttempt in range(max_chunk_retries):
+            try:
+                final_result = await use_llm_func(hint_prompt)
+                if final_result is not None:
+                    break
+            except Exception as e:
+                if retryAttempt < max_chunk_retries - 1:
+                    wait_time = 2 ** (retryAttempt + 1)  # 指数退避: 2, 4, 8秒
+                    logger.warning(f"Chunk {chunk_key} LLM call failed (attempt {retryAttempt + 1}/{max_chunk_retries}): {e}. Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"Chunk {chunk_key} LLM call failed after {max_chunk_retries} attempts: {e}")
+        
         if final_result is None:
             return None,None,None,None
 
