@@ -8,7 +8,54 @@ PROMPTS["DEFAULT_RECORD_DELIMITER"] = "\n"
 PROMPTS["DEFAULT_COMPLETION_DELIMITER"] = "<|COMPLETE|>"
 PROMPTS["process_tickers"] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
-PROMPTS["DEFAULT_ENTITY_TYPES"] = ["organization", "person", "geo", "event", "role", "concept"]
+PROMPTS["DEFAULT_ENTITY_TYPES"] = [
+    "DISEASE",
+    "SYMPTOM",
+    "SIGN",
+    "DRUG",
+    "TREATMENT",
+    "EXAMINATION",
+    "ANATOMICAL_STRUCTURE",
+    "PHYSIOLOGICAL_FUNCTION",
+    "PATHOLOGICAL_MECHANISM",
+    "GENE",
+    "PROTEIN",
+    "PATHWAY",
+    "RISK_FACTOR",
+    "DIAGNOSTIC_CRITERION",
+    "OTHER",
+]
+
+PROMPTS["DEFAULT_RELATION_TYPES"] = [
+    "CAUSES",
+    "ASSOCIATED_WITH",
+    "INDICATES",
+    "DIAGNOSES",
+    "TREATS",
+    "PREVENTS",
+    "COMPLICATES",
+    "LOCATED_IN",
+    "AFFECTS",
+    "REGULATES",
+    "PART_OF",
+    "INTERACTS_WITH",
+    "MECHANISM_OF",
+    "RISK_FACTOR_FOR",
+    "DIFFERENTIAL_DIAGNOSIS",
+    "CO_OCCURS_WITH",
+    "OTHER",
+]
+
+PROMPTS["DEFAULT_HIGH_ORDER_RELATION_TYPES"] = [
+    "MULTI_FACTOR_MECHANISM",
+    "CLINICAL_SYNDROME",
+    "DIAGNOSTIC_PATTERN",
+    "THERAPEUTIC_STRATEGY",
+    "COMORBIDITY_PATTERN",
+    "PATHWAY_PROCESS",
+    "DIFFERENTIAL_GROUP",
+    "OTHER",
+]
 
 PROMPTS["entity_extraction"] = """-Goal-
 Given a text document related to some knowledge or story and a list of entity types, identify all entities of these types from the text. Then construct hyperedges by extracting complex relationships among the identified entities.
@@ -27,10 +74,11 @@ Format each entity as ("Entity"{tuple_delimiter}<entity_name>{tuple_delimiter}<e
 2. From the entities identified in step 1, identify all pairs of (source_entity, target_entity) that are *clearly related* to each other.
 For each pair of related entities, extract the following information:
 - entities_pair: The name of source entity and target entity, as identified in step 1.
+- edge_type: One of the following relation types: [{relation_types}]
 - low_order_relationship_description: Explanation as to why you think the source entity and the target entity are related to each other.
 - low_order_relationship_keywords: Keywords that summarize the overarching nature of the relationship, focusing on concepts or themes rather than specific details.
 - low_order_relationship_strength: A numerical score indicating the strength of the relationship between the entities.
-Format each hyperedge as ("Low-order Hyperedge"{tuple_delimiter}<entity_name1>{tuple_delimiter}<entity_name2>{tuple_delimiter}<low_order_relationship_description>{tuple_delimiter}<low_order_relationship_keywords>{tuple_delimiter}<low_order_relationship_strength>)
+Format each hyperedge as ("Low-order Hyperedge"{tuple_delimiter}<entity_name1>{tuple_delimiter}<entity_name2>{tuple_delimiter}<edge_type>{tuple_delimiter}<low_order_relationship_description>{tuple_delimiter}<low_order_relationship_keywords>{tuple_delimiter}<low_order_relationship_strength>)
 
 3. Based on the relationships identified in Step 2, extract high-level keywords that summarize the main idea, major concept, or themes of the important passage. 
 (Note: The content of high-level keywords should capture the overarching ideas present in the document, avoiding vague or empty terms).
@@ -41,11 +89,12 @@ Format content keywords as ("High-level keywords"{tuple_delimiter}<high_level_ke
 Extract the following information from all related entities, entity pairs, and high-level keywords:
 
 - entities_set: The collection of names for elements in high-order associated entity set, as identified in step 1.
+- edge_type: One of the following high-order relation types: [{high_order_relation_types}]
 - high_order_relationship_description: Use the relationships among the entities in the set to create a detailed, smooth, and comprehensive description that covers all entities in the set, without leaving out any relevant information.
 - high_order_relationship_generalization: Summarize the content of the entity set as concisely as possible.
 - high_order_relationship_keywords: Keywords that summarize the overarching nature of the high-order association, focusing on concepts or themes rather than specific details.
 - high_order_relationship_strength: A numerical score indicating the strength of the association among the entities in the set.
-Format each association as ("High-order Hyperedge"{tuple_delimiter}<entity_name1>{tuple_delimiter}<entity_name2>{tuple_delimiter}<entity_nameN>{tuple_delimiter}<high_order_relationship_description>{tuple_delimiter}<high_order_relationship_generalization>{tuple_delimiter}<high_order_relationship_keywords>{tuple_delimiter}<high_order_relationship_strength>)
+Format each association as ("High-order Hyperedge"{tuple_delimiter}<entity_name1>{tuple_delimiter}<entity_name2>{tuple_delimiter}<entity_nameN>{tuple_delimiter}<edge_type>{tuple_delimiter}<high_order_relationship_description>{tuple_delimiter}<high_order_relationship_generalization>{tuple_delimiter}<high_order_relationship_keywords>{tuple_delimiter}<high_order_relationship_strength>)
 
 5. Return output in {language} as a single list of all entities, relationships and associations identified in steps 1, 2 and 4. Use **{record_delimiter}** as the list delimiter.
 
@@ -64,7 +113,10 @@ Please carefully identify and screen the legality of the content.
 ######################
 -Real Data-
 ######################
-Entity_types: [{entity_types}]. You may extract additional types you consider appropriate, the more the better.
+Entity_types: [{entity_types}]
+Relation_types: [{relation_types}]
+High_order_relation_types: [{high_order_relation_types}]
+Use only the provided entity and relation type labels. If no label fits, use OTHER. Do not invent new type labels.
 Text: {input_text}
 ######################
 Output:
@@ -147,32 +199,24 @@ Output:
 #############################""",
     """Example 4:
 
-Entity_types: [person, role, technology, organization, event, location, concept]
+Entity_types: [DISEASE, SYMPTOM, SIGN, DRUG, TREATMENT, EXAMINATION, ANATOMICAL_STRUCTURE, PHYSIOLOGICAL_FUNCTION, PATHOLOGICAL_MECHANISM, GENE, PROTEIN, PATHWAY, RISK_FACTOR, DIAGNOSTIC_CRITERION, OTHER]
+Relation_types: [CAUSES, ASSOCIATED_WITH, INDICATES, DIAGNOSES, TREATS, PREVENTS, COMPLICATES, LOCATED_IN, AFFECTS, REGULATES, PART_OF, INTERACTS_WITH, MECHANISM_OF, RISK_FACTOR_FOR, DIFFERENTIAL_DIAGNOSIS, CO_OCCURS_WITH, OTHER]
+High_order_relation_types: [MULTI_FACTOR_MECHANISM, CLINICAL_SYNDROME, DIAGNOSTIC_PATTERN, THERAPEUTIC_STRATEGY, COMORBIDITY_PATTERN, PATHWAY_PROCESS, DIFFERENTIAL_GROUP, OTHER]
 Text:
-Five Aurelian nationals who had been sentenced to 8 years in Firuzabad and widely considered hostages are on their way home. When $8 billion in Firuzi funds was transferred to financial institutions in Krohala,
-
-the capital of Quantara, the Quantara-orchestrated swap deal was finally completed. The exchange initiated in Tiruzia, the capital of Firuzabad, led to four men and one woman boarding a chartered flight to Krohala;
-
-they are also Firuzi citizens. They were welcomed by senior Aurelian officials and are now en route to Kasyn, the capital of Aurelia.
+Anti-NMDA receptor antibody encephalitis is a form of autoimmune encephalitis often associated with ovarian teratoma. Spinal fluid analysis can support the diagnosis. Resection of the teratoma is part of treatment.
 #############
 Output:
-("Entity"{tuple_delimiter}Aurelian nationals{tuple_delimiter}person{tuple_delimiter}Five nationals from Aurelia, considered hostages, sentenced to 8 years in Firuzabad. They were recently involved in a swap deal for their release.{tuple_delimiter}sentenced, hostages, returning home){record_delimiter}
-("Entity"{tuple_delimiter}Firuzabad{tuple_delimiter}location{tuple_delimiter}Capital of Firuzabad, where the Aurelian nationals had been sentenced to 8 years.{tuple_delimiter}location of sentencing, destination of the hostages){record_delimiter}
-("Entity"{tuple_delimiter}Krohala{tuple_delimiter}location{tuple_delimiter}Capital of Quantara, where the Aurelian nationals were transferred after the swap deal.{tuple_delimiter}destination of the exchange, capital city){record_delimiter}
-("Entity"{tuple_delimiter}Quantara{tuple_delimiter}location{tuple_delimiter}The country orchestrating the swap deal for the release of the Aurelian nationals.{tuple_delimiter}mediating nation){record_delimiter}
-("Entity"{tuple_delimiter}Tiruzia{tuple_delimiter}ocation{tuple_delimiter}Capital of Firuzabad, where the exchange was initiated for the Aurelian nationals.{tuple_delimiter}location of the initiation){record_delimiter}
-("Entity"{tuple_delimiter}Kasyn{tuple_delimiter}location{tuple_delimiter}Capital of Aurelia, where the Aurelian officials welcomed the returnees.{tuple_delimiter}destination of the return, city of reception){record_delimiter}
-("Entity"{tuple_delimiter}Firuzi funds{tuple_delimiter}concept{tuple_delimiter}$8 billion associated with Firuzabad, transferred as part of the swap deal for the return of the Aurelian nationals.{tuple_delimiter}transfer of funds, financial deal){record_delimiter}
-("Entity"{tuple_delimiter}swap deal{tuple_delimiter}event{tuple_delimiter}The exchange arrangement that led to the release of five Aurelian nationals, involving the transfer of Firuzi funds.{tuple_delimiter}release of hostages, financial negotiation){record_delimiter}
-("Entity"{tuple_delimiter}Aurelian officials{tuple_delimiter}role{tuple_delimiter}Senior officials from Aurelia who welcomed the returned nationals.{tuple_delimiter}role of welcoming, governmental function){record_delimiter}
-("Low-order Hyperedge"{tuple_delimiter}swap deal{tuple_delimiter}Aurelian nationals{tuple_delimiter}The swap deal directly resulted in the release and return of the Aurelian nationals.{tuple_delimiter}release, exchange{tuple_delimiter}9){record_delimiter}
-("Low-order Hyperedge"{tuple_delimiter}Aurelian nationals{tuple_delimiter}Krohala{tuple_delimiter}Krohala is the final destination where the Aurelian nationals were taken after the swap deal was completed.{tuple_delimiter}destination, transfer{tuple_delimiter}8){record_delimiter}
-("Low-order Hyperedge"{tuple_delimiter}Firuzabad{tuple_delimiter}Aurelian nationals{tuple_delimiter}The Aurelian nationals were sentenced in Firuzabad, leading to their situation as hostages.{tuple_delimiter}sentencing, captivity{tuple_delimiter}8){record_delimiter}
-("Low-order Hyperedge"{tuple_delimiter}Quantara{tuple_delimiter}swap deal{tuple_delimiter}Quantara orchestrated the swap deal that facilitated the release of the Aurelian nationals.{tuple_delimiter}mediation, organization{tuple_delimiter}9){record_delimiter}
-("Low-order Hyperedge"{tuple_delimiter}Tiruzia{tuple_delimiter}swap deal{tuple_delimiter}Tiruzia is where the swap deal was initiated for the Aurelian nationals to be exchanged.{tuple_delimiter}initiation, action{tuple_delimiter}7){record_delimiter}
-("Low-order Hyperedge"{tuple_delimiter}Kasyn{tuple_delimiter}Aurelian officials{tuple_delimiter}The Aurelian officials were present in Kasyn to welcome the Aurelian nationals upon their return.{tuple_delimiter}reception, welcome{tuple_delimiter}8){record_delimiter}
-("High-level keywords"{tuple_delimiter}Aurelian nationals, swap deal, return, international relations){record_delimiter}
-("High-order Hyperedge"{tuple_delimiter}Aurelian nationals{tuple_delimiter}swap deal{tuple_delimiter}Krohala{tuple_delimiter}The Aurelian nationals are intrinsically linked through the swap deal orchestrated by Quantara, with Krohala being the destination following their release. Their return signifies a complex interplay between international relations, hostage situations, and community reception represented by Aurelian officials.{tuple_delimiter}International exchange and diplomacy regarding hostage situations{tuple_delimiter}return, release, international relations, mediation{tuple_delimiter}9){completion_delimiter}
+("Entity"{tuple_delimiter}anti-NMDA receptor antibody{tuple_delimiter}PROTEIN{tuple_delimiter}An autoantibody used as a disease-specific molecular marker in anti-NMDA receptor encephalitis.{tuple_delimiter}autoimmune marker, antibody-mediated disease){record_delimiter}
+("Entity"{tuple_delimiter}anti-NMDA receptor encephalitis{tuple_delimiter}DISEASE{tuple_delimiter}A form of autoimmune encephalitis associated with anti-NMDA receptor antibodies and sometimes ovarian teratoma.{tuple_delimiter}autoimmune encephalitis, paraneoplastic association){record_delimiter}
+("Entity"{tuple_delimiter}ovarian teratoma{tuple_delimiter}DISEASE{tuple_delimiter}A tumor that can be associated with anti-NMDA receptor encephalitis in a paraneoplastic setting.{tuple_delimiter}tumor, associated lesion){record_delimiter}
+("Entity"{tuple_delimiter}spinal fluid analysis{tuple_delimiter}EXAMINATION{tuple_delimiter}A diagnostic examination used to support the diagnosis of autoimmune encephalitis.{tuple_delimiter}diagnostic test, cerebrospinal fluid evaluation){record_delimiter}
+("Entity"{tuple_delimiter}resection{tuple_delimiter}TREATMENT{tuple_delimiter}A surgical treatment used to remove an associated ovarian teratoma as part of management.{tuple_delimiter}surgery, tumor removal){record_delimiter}
+("Low-order Hyperedge"{tuple_delimiter}anti-NMDA receptor antibody{tuple_delimiter}anti-NMDA receptor encephalitis{tuple_delimiter}INDICATES{tuple_delimiter}The antibody strongly supports and points toward the diagnosis of anti-NMDA receptor encephalitis.{tuple_delimiter}autoantibody, diagnostic marker{tuple_delimiter}9){record_delimiter}
+("Low-order Hyperedge"{tuple_delimiter}ovarian teratoma{tuple_delimiter}anti-NMDA receptor encephalitis{tuple_delimiter}ASSOCIATED_WITH{tuple_delimiter}Ovarian teratoma is a well-known associated condition in anti-NMDA receptor encephalitis.{tuple_delimiter}paraneoplastic association, tumor link{tuple_delimiter}8){record_delimiter}
+("Low-order Hyperedge"{tuple_delimiter}spinal fluid analysis{tuple_delimiter}anti-NMDA receptor encephalitis{tuple_delimiter}DIAGNOSES{tuple_delimiter}Spinal fluid analysis can support the diagnostic workup for anti-NMDA receptor encephalitis.{tuple_delimiter}diagnosis, laboratory support{tuple_delimiter}8){record_delimiter}
+("Low-order Hyperedge"{tuple_delimiter}resection{tuple_delimiter}ovarian teratoma{tuple_delimiter}TREATS{tuple_delimiter}Resection treats the associated ovarian teratoma that contributes to the overall disease management strategy.{tuple_delimiter}surgery, treatment, tumor removal{tuple_delimiter}8){record_delimiter}
+("High-level keywords"{tuple_delimiter}autoimmune encephalitis, antibody marker, ovarian teratoma, diagnosis, surgical treatment){record_delimiter}
+("High-order Hyperedge"{tuple_delimiter}anti-NMDA receptor antibody{tuple_delimiter}anti-NMDA receptor encephalitis{tuple_delimiter}spinal fluid analysis{tuple_delimiter}DIAGNOSTIC_PATTERN{tuple_delimiter}The antibody, disease entity, and spinal fluid analysis together form a coherent diagnostic pattern for anti-NMDA receptor encephalitis in clinical evaluation.{tuple_delimiter}autoimmune encephalitis diagnostic pattern{tuple_delimiter}diagnosis, antibody, cerebrospinal fluid{tuple_delimiter}9){completion_delimiter}
 #############################""",
     """Example 5:
 

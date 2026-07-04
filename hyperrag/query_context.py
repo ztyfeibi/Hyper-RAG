@@ -73,13 +73,14 @@ async def _build_entity_query_context(
     entities_context = list_of_list_to_csv(entities_section_list)
 
     relations_section_list = [
-        ["id", "entity set", "description", "keywords", "weight", "rank"]
+        ["id", "entity set", "type", "description", "keywords", "weight", "rank"]
     ]
     for i, e in enumerate(use_relations):
         relations_section_list.append(
             [
                 i,
                 e["src_tgt"],
+                e.get("edge_type", "OTHER"),
                 e["description"],
                 e["keywords"],
                 e["weight"],
@@ -127,6 +128,7 @@ async def _build_entity_query_context(
             {
                 "id": i,
                 "entity_set": e["src_tgt"],
+                "edge_type": e.get("edge_type", "OTHER"),
                 "description": e["description"],
                 "keywords": e["keywords"],
                 "weight": e["weight"],
@@ -315,13 +317,14 @@ async def _build_relation_query_context(
         f"relation query uses {len(use_entities)} entites, {len(edge_datas)} relations, {len(use_text_units)} text units"
     )
     relations_section_list = [
-        ["id", "entity set", "description", "keywords", "weight", "rank"]
+        ["id", "entity set", "type", "description", "keywords", "weight", "rank"]
     ]
     for i, e in enumerate(edge_datas):
         relations_section_list.append(
             [
                 i,
                 e["id_set"],
+                e.get("edge_type", "OTHER"),
                 e["description"],
                 e["keywords"],
                 e["weight"],
@@ -382,6 +385,7 @@ async def _build_relation_query_context(
             {
                 "id": i,
                 "entity_set": e["id_set"],
+                "edge_type": e.get("edge_type", "OTHER"),
                 "description": e["description"],
                 "keywords": e["keywords"],
                 "weight": e["weight"],

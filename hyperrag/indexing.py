@@ -55,6 +55,8 @@ async def extract_entities(
     context_base = dict(
         language=PROMPTS["DEFAULT_LANGUAGE"],
         entity_types=",".join(PROMPTS["DEFAULT_ENTITY_TYPES"]),
+        relation_types=",".join(PROMPTS["DEFAULT_RELATION_TYPES"]),
+        high_order_relation_types=",".join(PROMPTS["DEFAULT_HIGH_ORDER_RELATION_TYPES"]),
         tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
         record_delimiter=PROMPTS["DEFAULT_RECORD_DELIMITER"],
         completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
@@ -224,8 +226,15 @@ async def extract_entities(
     if entity_vdb is not None:
         data_for_vdb = {
             compute_mdhash_id(dp["entity_name"], prefix="ent-"): {
-                "content": dp["entity_name"] + dp["description"],
+                "content": " | ".join(
+                    [
+                        dp.get("entity_type", "OTHER"),
+                        dp["entity_name"],
+                        dp.get("description", ""),
+                    ]
+                ),
                 "entity_name": dp["entity_name"],
+                "entity_type": dp.get("entity_type", "OTHER"),
             }
             for dp in all_entities_data
         }
@@ -235,9 +244,16 @@ async def extract_entities(
         data_for_vdb = {
             compute_mdhash_id(str(sorted(dp["id_set"])), prefix="rel-"): {
                 "id_set": dp["id_set"],
-                "content": dp["keywords"]
-                           + str(dp["id_set"])
-                           + dp["description"],
+                "edge_type": dp.get("edge_type", "OTHER"),
+                "content": " | ".join(
+                    [
+                        dp.get("edge_type", "OTHER"),
+                        str(dp["id_set"]),
+                        dp.get("keywords", ""),
+                        dp.get("generalization", ""),
+                        dp.get("description", ""),
+                    ]
+                ),
             }
             for dp in all_relationships_data
         }

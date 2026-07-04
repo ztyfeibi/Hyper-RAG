@@ -1,6 +1,10 @@
 """LLM extraction record parsers."""
 
+from .prompt import PROMPTS
 from .utils import clean_str, is_float_regex
+
+
+HIGH_ORDER_RELATION_TYPES = set(PROMPTS["DEFAULT_HIGH_ORDER_RELATION_TYPES"])
 
 
 async def _handle_single_entity_extraction(
@@ -36,7 +40,12 @@ async def _handle_single_relationship_extraction_low(
     if len(record_attributes) < 6 or record_attributes[0] != '"Low-order Hyperedge"':
         return None
     # add this record as hyperedge
-    entity_num = len(record_attributes) - 3
+    if len(record_attributes) >= 7:
+        entity_num = len(record_attributes) - 4
+        edge_type = clean_str(record_attributes[entity_num].upper())
+    else:
+        entity_num = len(record_attributes) - 3
+        edge_type = "OTHER"
     entities = []
     for i in range(1, entity_num):
         entities.append(clean_str(record_attributes[i].upper()))
@@ -50,6 +59,7 @@ async def _handle_single_relationship_extraction_low(
     return dict(
         entityN=entities,
         weight=weight,
+        edge_type=edge_type,
         description=edge_description,
         keywords=edge_keywords,
         source_id=edge_source_id,
@@ -64,11 +74,20 @@ async def _handle_single_relationship_extraction_high(
     if len(record_attributes) < 7 or record_attributes[0] != '"High-order Hyperedge"':
         return None
     # add this record as hyperedge
-    entity_num = len(record_attributes) - 4
+    candidate_edge_type = ""
+    if len(record_attributes) >= 8:
+        candidate_edge_type = clean_str(record_attributes[-5].upper())
+    if candidate_edge_type in HIGH_ORDER_RELATION_TYPES:
+        entity_num = len(record_attributes) - 5
+        edge_type = candidate_edge_type
+    else:
+        entity_num = len(record_attributes) - 4
+        edge_type = "OTHER"
     entities = []
     for i in range(1, entity_num):
         entities.append(clean_str(record_attributes[i].upper()))
     edge_description = clean_str(record_attributes[-4])
+    edge_generalization = clean_str(record_attributes[-3])
     edge_keywords = clean_str(record_attributes[-2])
     edge_source_id = chunk_key
     weight = (
@@ -77,7 +96,9 @@ async def _handle_single_relationship_extraction_high(
     return dict(
         entityN=entities,
         weight=weight,
+        edge_type=edge_type,
         description=edge_description,
+        generalization=edge_generalization,
         keywords=edge_keywords,
         source_id=edge_source_id,
         level_hg="High-order Hyperedge",

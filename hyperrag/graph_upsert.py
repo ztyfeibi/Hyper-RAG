@@ -233,6 +233,8 @@ async def _merge_edges_then_upsert(
     already_source_ids = []
     already_description = []
     already_keywords = []
+    already_edge_types = []
+    already_generalization = []
 
     if await knowledge_hypergraph_inst.has_hyperedge(id_set):
         already_edge = await knowledge_hypergraph_inst.get_hyperedge(id_set)
@@ -244,10 +246,25 @@ async def _merge_edges_then_upsert(
         already_keywords.extend(
             split_string_by_multi_markers(already_edge["keywords"], [GRAPH_FIELD_SEP])
         )
+        already_edge_types.append(already_edge.get("edge_type", "OTHER"))
+        already_generalization.append(already_edge.get("generalization", ""))
 
     weight = sum([dp["weight"] for dp in edges_data] + already_weights)
+    edge_type = sorted(
+        Counter(
+            [dp.get("edge_type", "OTHER") for dp in edges_data] + already_edge_types
+        ).items(),
+        key=lambda x: x[1],
+        reverse=True,
+    )[0][0]
     description = GRAPH_FIELD_SEP.join(
         sorted(set([dp["description"] for dp in edges_data] + already_description))
+    )
+    generalization_values = (
+        [dp.get("generalization", "") for dp in edges_data] + already_generalization
+    )
+    generalization = GRAPH_FIELD_SEP.join(
+        sorted(set(g for g in generalization_values if g))
     )
     keywords = GRAPH_FIELD_SEP.join(
         sorted(set([dp["keywords"] for dp in edges_data] + already_keywords))
@@ -281,7 +298,9 @@ async def _merge_edges_then_upsert(
             description=description,
             keywords=filter_keywords,
             source_id=source_id,
-            weight=weight
+            weight=weight,
+            edge_type=edge_type,
+            generalization=generalization,
         ),
     )
 
@@ -289,6 +308,8 @@ async def _merge_edges_then_upsert(
         id_set=id_set,
         description=description,
         keywords=filter_keywords,
+        edge_type=edge_type,
+        generalization=generalization,
     )
 
     return edge_data
