@@ -1,4 +1,5 @@
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -51,11 +52,10 @@ async def embedding_func(texts: list[str]) -> np.ndarray:
         model=EMB_MODEL,
         api_key=EMB_API_KEY,
         base_url=EMB_BASE_URL,
-        dimensions=EMB_DIM,
     )
 
 
-def insert_text(rag, file_path, retries=0, max_retries=3):
+def insert_text(rag, file_path, retries=0, max_retries=3, limit=None):
     """读取 Step_0 生成的 context 文件，并调用 HyperRAG.insert 建索引。
 
     file_path 默认形如：
@@ -66,11 +66,20 @@ def insert_text(rag, file_path, retries=0, max_retries=3):
     2. chunk 向量入库；
     3. LLM 抽取实体和低阶/高阶超边；
     4. 写入实体向量库、关系向量库和 hypergraph hgdb 文件。
+
+    limit: 若不为 None，只取前 limit 条 context 拼成文本，用于小规模冒烟测试。
     """
-    with open(file_path, "r", encoding="utf-8") as f:
-        # 注意：这里读出来的是 JSON 文件的原始字符串，而不是 json.load 后的 list。
-        # 当前脚本把整个 JSON 文本作为一个大文档交给 HyperRAG.insert。
-        unique_contexts = f.read()
+    if limit is not None:
+        # 小规模测试模式：json.load 取前 limit 条 context 拼接
+        with open(file_path, "r", encoding="utf-8") as f:
+            contexts = json.load(f)
+        contexts = contexts[:limit]
+        unique_contexts = "".join(contexts)
+        print(f"[Smoke test] Using first {limit} contexts "
+              f"({len(unique_contexts)} chars)")
+    else:
+        with open(file_path, "r", encoding="utf-8") as f:
+            unique_contexts = f.read()
 
     while retries < max_retries:
         try:
@@ -95,7 +104,14 @@ if __name__ == "__main__":
         default=DEFAULT_DATA_NAME,
         help=f"工作目录 caches/<name>（默认 {DEFAULT_DATA_NAME!r}）",
     )
-    data_name = parser.parse_args().data_name
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="只取前 N 条 context 做小规模冒烟测试（默认全量）",
+    )
+    args = parser.parse_args()
+    data_name = args.data_name
 
     # HyperRAG 的所有持久化产物都会落在这个目录下：
     # kv_store_full_docs.json、kv_store_text_chunks.json、vdb_*.json、
@@ -115,10 +131,17 @@ if __name__ == "__main__":
         # 实体/超边抽取所需的 LLM 调用次数。
         chunk_token_size=2400,
         chunk_overlap_token_size=120,
-        # 降低 LLM 并发，减轻 SiliconFlow 等兼容网关的 429 / RetryError 风险。
-        llm_model_max_async=1,
+        # 内网 vLLM 无 429 限流风险，适度提高并发加速建库
+        llm_model_max_async=4,
         embedding_func_max_async=4,
+        # 禁用 gleaning：qwen-27b 24K context 不足以容纳 history + continue_prompt
+        # 几乎所有 gleaning 调用都因 context 超长失败，跑 864 轮白白浪费 5+ 小时
+        entity_extract_max_gleaning=0,
     )
 
     # 读取 Step_0 的输出，并开始构建 HyperRAG 所需的全部索引和超图数据。
-    insert_text(rag, f"caches/{data_name}/contexts/{data_name}_unique_contexts.json")
+    insert_text(
+        rag,
+        f"caches/{data_name}/contexts/{data_name}_unique_contexts.json",
+        limit=args.limit,
+    )

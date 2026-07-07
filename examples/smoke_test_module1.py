@@ -57,7 +57,6 @@ async def embedding_func(texts: list[str]) -> np.ndarray:
         model=EMB_MODEL,
         api_key=EMB_API_KEY,
         base_url=EMB_BASE_URL,
-        dimensions=EMB_DIM,
     )
 
 

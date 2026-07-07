@@ -50,7 +50,6 @@ async def embedding_func(texts: list[str]) -> np.ndarray:
         model=EMB_MODEL,
         api_key=EMB_API_KEY,
         base_url=EMB_BASE_URL,
-        dimensions=EMB_DIM,
     )
 
 
@@ -156,7 +155,15 @@ if __name__ == "__main__":
     # - naive：只查 chunk 向量库；
     # - hyper：查实体、关系和超图上下文；
     # - hyper-lite：只查实体相关上下文，速度更轻。
-    query_param = QueryParam(mode=mode)
+    # chunk_token_size=2400，默认 max_token_for_text_unit=1600 连 1 个 chunk 都装不下。
+    # 但 hyper 走两条线（entity+relation），各检索 text units 后合并去重，
+    # 预算太大会导致合并后总 token 超 qwen-27b 的 24K context。
+    if mode == "naive":
+        # 单线检索，预算可以给大
+        query_param = QueryParam(mode=mode, max_token_for_text_unit=12000)
+    else:
+        # hyper/hyper-lite 双线检索，每线预算减半避免合并后超限
+        query_param = QueryParam(mode=mode, max_token_for_text_unit=4000)
 
     OUT_DIR = WORKING_DIR / "response"
     OUT_DIR.mkdir(parents=True, exist_ok=True)

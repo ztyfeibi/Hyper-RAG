@@ -36,7 +36,9 @@ def llm_model_func(prompt, system_prompt=None, history_messages=[], **kwargs) ->
     messages.append({"role": "user", "content": prompt})
 
     response = openai_client.chat.completions.create(
-        model=LLM_MODEL, messages=messages, **kwargs
+        model=LLM_MODEL, messages=messages,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        **kwargs
     )
     return response.choices[0].message.content
 

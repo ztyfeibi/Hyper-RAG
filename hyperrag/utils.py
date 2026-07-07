@@ -94,21 +94,19 @@ def compute_mdhash_id(content, prefix: str = ""):
 
 
 def limit_async_func_call(max_size: int, waitting_time: float = 0.0001):
-    """限制异步函数的最大并发数，主要用于 LLM 和 embedding API。"""
+    """限制异步函数的最大并发数，主要用于 LLM 和 embedding API。
+
+    使用 asyncio.Semaphore 替代手动计数器，避免高并发下的竞态条件。
+    """
 
     def final_decro(func):
-        """Not using async.Semaphore to aovid use nest-asyncio"""
-        __current_size = 0
+        sem = asyncio.Semaphore(max_size)
 
         @wraps(func)
         async def wait_func(*args, **kwargs):
-            nonlocal __current_size
-            while __current_size >= max_size:
-                await asyncio.sleep(waitting_time)
-            __current_size += 1
-            result = await func(*args, **kwargs)
-            __current_size -= 1
-            return result
+            async with sem:
+                result = await func(*args, **kwargs)
+                return result
 
         return wait_func
 
@@ -218,11 +216,14 @@ def truncate_list_by_token_size(list_data: list, key: callable, max_token_size: 
     """按 token 总量截断列表，避免拼给 LLM 的上下文过长。"""
     if max_token_size <= 0:
         return []
+    if not list_data:
+        return []
     tokens = 0
     for i, data in enumerate(list_data):
         tokens += len(encode_string_by_tiktoken(key(data)))
         if tokens > max_token_size:
-            return list_data[:i]
+            # 至少保留第一个元素，避免单个元素就超预算时返回空列表
+            return list_data[:max(1, i)]
     return list_data
 
 

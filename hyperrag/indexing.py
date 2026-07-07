@@ -91,7 +91,7 @@ async def extract_entities(
                 if retryAttempt < max_chunk_retries - 1:
                     wait_time = 2 ** (retryAttempt + 1)  # 指数退避: 2, 4, 8秒
                     logger.warning(f"Chunk {chunk_key} LLM call failed (attempt {retryAttempt + 1}/{max_chunk_retries}): {e}. Retrying in {wait_time}s...")
-                    time.sleep(wait_time)
+                    await asyncio.sleep(wait_time)
                 else:
                     logger.error(f"Chunk {chunk_key} LLM call failed after {max_chunk_retries} attempts: {e}")
         
@@ -100,7 +100,11 @@ async def extract_entities(
 
         history = pack_user_ass_to_openai_messages(hint_prompt, final_result)
         for now_glean_index in range(entity_extract_max_gleaning):
-            glean_result = await use_llm_func(continue_prompt, history_messages=history)
+            try:
+                glean_result = await use_llm_func(continue_prompt, history_messages=history)
+            except Exception as e:
+                logger.warning(f"Chunk {chunk_key} gleaning call failed (attempt {now_glean_index + 1}): {e}. Skipping gleaning.")
+                break
             if glean_result is None:
                 break
 
@@ -109,9 +113,13 @@ async def extract_entities(
             if now_glean_index == entity_extract_max_gleaning - 1:
                 break
 
-            if_loop_result: str = await use_llm_func(
-                if_loop_prompt, history_messages=history
-            )
+            try:
+                if_loop_result: str = await use_llm_func(
+                    if_loop_prompt, history_messages=history
+                )
+            except Exception as e:
+                logger.warning(f"Chunk {chunk_key} if_loop call failed: {e}. Stopping gleaning.")
+                break
             if_loop_result = if_loop_result.strip().strip('"').strip("'").lower()
             if if_loop_result != "yes":
                 break
@@ -172,8 +180,8 @@ async def extract_entities(
 
         # 计算用时
         current_time = datetime.now()
-        time = current_time - begin_time
-        total_seconds = int(time.total_seconds())
+        elapsed = current_time - begin_time
+        total_seconds = int(elapsed.total_seconds())
         hours = total_seconds // 3600
         minutes = (total_seconds % 3600) // 60
         seconds = total_seconds % 60

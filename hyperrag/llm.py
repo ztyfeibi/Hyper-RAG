@@ -80,7 +80,7 @@ async def openai_complete_if_cache(
 
     response = await openai_async_client.chat.completions.create(
         model=model, messages=messages,
-        extra_body={"enable_thinking": False},
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         **kwargs
     )
 
@@ -140,6 +140,7 @@ async def openai_complete_stream_if_cache(
         model=model,
         messages=messages,
         stream=True,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         **kwargs,
     )
 
@@ -197,7 +198,7 @@ async def azure_openai_complete_if_cache(
 
     response = await openai_async_client.chat.completions.create(
         model=model, messages=messages,
-        extra_body={"enable_thinking": False},
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         **kwargs
     )
 

@@ -24,7 +24,10 @@ def llm_model_func(prompt, system_prompt=None, history_messages=[], **kwargs) ->
     messages.append({"role": "user", "content": prompt})
 
     response = openai_client.chat.completions.create(
-        model=LLM_MODEL, messages=messages, **kwargs
+        model=LLM_MODEL,
+        messages=messages,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        **kwargs,
     )
     return response.choices[0].message.content
 
@@ -155,12 +158,23 @@ def fetch_selection_results(responses):
 
 
 if __name__ == "__main__":
-    data_name = "mix"
-    question_stage = 2
-    # Note: we noticted that the position of the answer (first position or second position)
+    import argparse
+    parser = argparse.ArgumentParser(description="按 LLM 八维指标对两个模式进行 pairwise 对比")
+    parser.add_argument("--data-name", type=str, default="mix",
+                        help="caches/<name>/questions 与 response")
+    parser.add_argument("--a-mode", type=str, default="hyper",
+                        help="A 模式名（Answer 1），如 hyper / naive")
+    parser.add_argument("--b-mode", type=str, default="naive",
+                        help="B 模式名（Answer 2），如 naive / hyper")
+    parser.add_argument("--question-stage", type=int, default=2,
+                        choices=(1, 2, 3))
+    args = parser.parse_args()
+    data_name = args.data_name
+    question_stage = args.question_stage
+    # Note: we noticed that the position of the answer (first position or second position)
     # will effect the results. Thus, we suggest to average the results of
     # (A_mode vs. B_mode) and (B_mode vs. A_mode) as the final results.
-    A_mode, B_mode = "hyper", "naive"
+    A_mode, B_mode = args.a_mode, args.b_mode
     WORKING_DIR = Path("caches") / data_name
     RESPONSE_DIR = WORKING_DIR / "response"
     A_answer_file_path = RESPONSE_DIR / f"{A_mode}_{question_stage}_stage_result.json"

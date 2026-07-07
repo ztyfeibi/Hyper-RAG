@@ -28,7 +28,10 @@ def llm_model_func(prompt, system_prompt=None, history_messages=[], **kwargs) ->
     messages.append({"role": "user", "content": prompt})
 
     response = openai_client.chat.completions.create(
-        model=LLM_MODEL, messages=messages, **kwargs
+        model=LLM_MODEL,
+        messages=messages,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        **kwargs,
     )
     return response.choices[0].message.content
 
@@ -229,7 +232,7 @@ if __name__ == "__main__":
     # save the results to a JSON file
     OUT_DIR = WORKING_DIR / "evalation"
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    output_file_path = OUT_DIR / f"scoring_{question_stage}_stage_question.json"
+    output_file_path = OUT_DIR / f"scoring_{question_stage}_stage_question_{mode}.json"
     with open(output_file_path, "w", encoding="utf-8") as f:
         json.dump(responses, f, indent=4)
     print(f"Scoring-based evaluation results written to {output_file_path}\n\n")
