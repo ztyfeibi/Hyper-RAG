@@ -318,3 +318,165 @@ def test_apply_adjudication_accepts_human_queue(tmp_path, monkeypatch):
     assert remaining == []
     manifest = json.load(open(tmp_path / "verification_manifest.json", encoding="utf-8"))
     assert manifest["verified_count"] == 1
+
+
+
+def _replacement_fixture_record(candidate_id: str, chunk_id: str, text: str) -> dict:
+    content_hash = ev.sha256_text(text)
+    return {
+        "candidate_id": candidate_id,
+        "intended_structure": "single_fact",
+        "entry_type": "source",
+        "source_chunk_ids": [chunk_id],
+        "decision": "accept",
+        "rejection_reasons": [],
+        "answer_units": [{
+            "unit_id": "au1",
+            "statement": "Supported fact.",
+            "evidence_group_ids": ["eg1"],
+            "qwen_tokens": None,
+        }],
+        "spans": [{
+            "span_id": "sp1",
+            "chunk_id": chunk_id,
+            "text": text,
+            "chunk_content_hash": content_hash,
+            "char_start": 0,
+            "char_end": len(text),
+        }],
+        "evidence_groups": [{
+            "group_id": "eg1",
+            "answer_unit_id": "au1",
+            "span_ids": ["sp1"],
+            "rationale": "Direct support.",
+        }],
+        "qrels": [{
+            "answer_unit_id": "au1",
+            "relevant_chunk_ids": [chunk_id],
+            "relevant_span_ids": ["sp1"],
+        }],
+        "gold_answer": "Supported fact [au1].",
+        "review_verdicts": [],
+        "n_answer_units": 1,
+    }
+
+
+def _write_replacement_fixture_files(tmp_path: Path, verified: list[dict],
+                                     rejected: list[dict]) -> None:
+    for name, rows in {
+        "verified_evidence.jsonl": verified,
+        "rejected_evidence.jsonl": rejected,
+        "human_review_queue.jsonl": [],
+        "unprocessed_candidates.jsonl": [],
+    }.items():
+        (tmp_path / name).write_text(
+            "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+
+
+def test_apply_replacement_swaps_and_revalidates(tmp_path, monkeypatch):
+    vpe = _vpe()
+    monkeypatch.setattr(vpe, "STEP2_2_DIR", tmp_path)
+    monkeypatch.setattr(vpe, "STRUCTURE_QUOTA", {"single_fact": 1})
+    old = _replacement_fixture_record("old", "chunk-old", "Old fact.")
+    new = _replacement_fixture_record("new", "chunk-new", "Exact source quote.")
+    new["decision"] = "reject"
+    new["rejection_reasons"] = ["span@chunk-new:missing_bounds"]
+    new["spans"][0]["text"] = "normalized quote"
+    new["spans"][0]["char_start"] = None
+    new["spans"][0]["char_end"] = None
+    _write_replacement_fixture_files(tmp_path, [old], [new])
+
+    monkeypatch.setattr(
+        vpe, "load_candidate_pool",
+        lambda: ([{"candidate_id": "old"}], [{"candidate_id": "new"}], "hash"),
+    )
+    chunk_hash = ev.sha256_text("Exact source quote.")
+    monkeypatch.setattr(
+        vpe, "load_chunks",
+        lambda _data_name: (
+            {"chunk-new": "Exact source quote."},
+            {"chunk-new": chunk_hash},
+            {},
+        ),
+    )
+    monkeypatch.setattr(vpe, "count_qwen_tokens", lambda text: len(text.split()))
+
+    plan = tmp_path / "replacement.jsonl"
+    plan.write_text(
+        json.dumps({
+            "candidate_id": "new",
+            "replaces_candidate_id": "old",
+            "decision": "accept",
+            "reviewer": "unit-test",
+            "updates": {
+                "span_updates": {
+                    "sp1": {
+                        "text": "Exact source quote.",
+                        "char_start": 0,
+                        "char_end": len("Exact source quote."),
+                    }
+                }
+            },
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    vpe.phase_apply_replacement("dummy", plan)
+
+    verified = _load_jsonl(tmp_path / "verified_evidence.jsonl")
+    assert [item["candidate_id"] for item in verified] == ["new"]
+    assert verified[0]["decision"] == "accept"
+    assert verified[0]["rejection_reasons"] == []
+    assert verified[0]["qrels"][0]["relevant_chunk_ids"] == ["chunk-new"]
+    assert verified[0]["capacity"]["p4_raw_chunk_fit"] is True
+    assert _load_jsonl(tmp_path / "rejected_evidence.jsonl") == []
+    superseded = _load_jsonl(tmp_path / "superseded_evidence.jsonl")
+    assert superseded[0]["candidate_id"] == "old"
+    assert superseded[0]["superseded_by"] == "new"
+    manifest = json.load(open(tmp_path / "verification_manifest.json", encoding="utf-8"))
+    assert manifest["phase"] == "apply-replacement"
+    assert manifest["quota_met"] is True
+
+
+def test_apply_replacement_validation_failure_does_not_write(tmp_path, monkeypatch):
+    vpe = _vpe()
+    monkeypatch.setattr(vpe, "STEP2_2_DIR", tmp_path)
+    monkeypatch.setattr(vpe, "STRUCTURE_QUOTA", {"single_fact": 1})
+    old = _replacement_fixture_record("old", "chunk-old", "Old fact.")
+    new = _replacement_fixture_record("new", "chunk-new", "Exact source quote.")
+    _write_replacement_fixture_files(tmp_path, [old], [new])
+    original_bytes = (tmp_path / "verified_evidence.jsonl").read_bytes()
+
+    monkeypatch.setattr(
+        vpe, "load_candidate_pool",
+        lambda: ([{"candidate_id": "old"}], [{"candidate_id": "new"}], "hash"),
+    )
+    chunk_hash = ev.sha256_text("Exact source quote.")
+    monkeypatch.setattr(
+        vpe, "load_chunks",
+        lambda _data_name: (
+            {"chunk-new": "Exact source quote."},
+            {"chunk-new": chunk_hash},
+            {},
+        ),
+    )
+    monkeypatch.setattr(vpe, "count_qwen_tokens", lambda _text: 5001)
+
+    plan = tmp_path / "replacement.jsonl"
+    plan.write_text(
+        json.dumps({
+            "candidate_id": "new",
+            "replaces_candidate_id": "old",
+            "decision": "accept",
+            "reviewer": "unit-test",
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit, match="P4 cap"):
+        vpe.phase_apply_replacement("dummy", plan)
+
+    assert (tmp_path / "verified_evidence.jsonl").read_bytes() == original_bytes
+    assert not (tmp_path / "superseded_evidence.jsonl").exists()

@@ -29,9 +29,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import collections
+import copy
 import hashlib
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -1055,6 +1057,260 @@ def phase_apply_adjudication(data_name: str, adjudication_file: Path) -> None:
         json.dump(report, f, ensure_ascii=False, indent=2)
     print(f"[apply-adjudication] applied={len(applied)} remaining_human={len(remaining_human)}")
 
+
+def _apply_replacement_updates(item: dict, updates: dict) -> dict:
+    """Apply a small, auditable patch to one enriched evidence record."""
+    updated = copy.deepcopy(item)
+    for key in ("answer_units", "spans", "evidence_groups", "gold_answer"):
+        if key in updates:
+            updated[key] = copy.deepcopy(updates[key])
+
+    span_by_id = {span.get("span_id"): span for span in updated.get("spans", [])}
+    for span_id, patch in (updates.get("span_updates") or {}).items():
+        if span_id not in span_by_id:
+            raise ValueError(f"unknown span_id in replacement update: {span_id}")
+        unknown = set(patch) - {"text", "char_start", "char_end"}
+        if unknown:
+            raise ValueError(f"unsupported span update fields for {span_id}: {sorted(unknown)}")
+        span_by_id[span_id].update(patch)
+
+    au_by_id = {au.get("unit_id"): au for au in updated.get("answer_units", [])}
+    for unit_id, patch in (updates.get("answer_unit_updates") or {}).items():
+        if unit_id not in au_by_id:
+            raise ValueError(f"unknown answer unit in replacement update: {unit_id}")
+        if isinstance(patch, str):
+            patch = {"statement": patch}
+        unknown = set(patch) - {"statement"}
+        if unknown:
+            raise ValueError(f"unsupported answer-unit fields for {unit_id}: {sorted(unknown)}")
+        au_by_id[unit_id].update(patch)
+    return updated
+
+
+def _refresh_replacement_record(item: dict, chunk_texts: Dict[str, str],
+                                chunk_hashes: Dict[str, str]) -> List[str]:
+    """Recompute all derived evidence fields and return blocking problems."""
+    problems: List[str] = []
+    answer_units = item.get("answer_units") or []
+    spans = item.get("spans") or []
+    evidence_groups = item.get("evidence_groups") or []
+
+    if not 1 <= len(answer_units) <= 5:
+        problems.append(f"answer_unit_count={len(answer_units)} outside [1, 5]")
+    if len({au.get("unit_id") for au in answer_units}) != len(answer_units):
+        problems.append("duplicate answer unit ids")
+    if len({span.get("span_id") for span in spans}) != len(spans):
+        problems.append("duplicate span ids")
+
+    traceable, trace_problems = spans_traceable(spans, chunk_texts, chunk_hashes)
+    if not traceable:
+        problems.extend(trace_problems)
+    problems.extend(_evidence_group_problems(answer_units, evidence_groups, spans))
+
+    source_ids = item.get("source_chunk_ids") or []
+    missing_sources = sorted(set(source_ids) - set(chunk_texts))
+    if missing_sources:
+        problems.append(f"source chunks missing: {missing_sources}")
+
+    gold_answer = item.get("gold_answer") or ""
+    for au in answer_units:
+        unit_id = au.get("unit_id")
+        if unit_id and not re.search(rf"\[{re.escape(unit_id)}\]", gold_answer, re.IGNORECASE):
+            problems.append(f"gold_answer missing [{unit_id}]")
+
+    item["qrels"] = _qrels_from_answer_units(answer_units, evidence_groups, spans)
+    if not missing_sources:
+        raw_source = "\n".join(chunk_texts[cid] for cid in source_ids)
+        gold_spans = "\n".join(span.get("text", "") for span in spans)
+        raw_tokens = count_qwen_tokens(raw_source)
+        span_tokens = count_qwen_tokens(gold_spans)
+        item["capacity"] = collections.OrderedDict([
+            ("raw_source_qwen_tokens", raw_tokens),
+            ("gold_span_qwen_tokens", span_tokens),
+            ("p4_raw_chunk_fit", raw_tokens <= P4_SOURCE_CAP_QWEN),
+            ("p4_gold_span_fit", span_tokens <= P4_SOURCE_CAP_QWEN),
+            ("retrieval_capacity_risk", raw_tokens > P4_SOURCE_CAP_QWEN),
+        ])
+        if raw_tokens > P4_SOURCE_CAP_QWEN:
+            problems.append(
+                f"raw_source_qwen_tokens={raw_tokens} > P4 cap {P4_SOURCE_CAP_QWEN}"
+            )
+        if span_tokens > P4_SOURCE_CAP_QWEN:
+            problems.append(
+                f"gold_span_qwen_tokens={span_tokens} > P4 cap {P4_SOURCE_CAP_QWEN}"
+            )
+
+    item["n_answer_units"] = len(answer_units)
+    forbidden = check_forbidden_fields(item)
+    if forbidden:
+        problems.append(f"forbidden_fields:{forbidden}")
+    return problems
+
+
+def _index_unique(rows: Sequence[dict], label: str) -> Dict[str, dict]:
+    indexed: Dict[str, dict] = {}
+    for row in rows:
+        candidate_id = row.get("candidate_id")
+        if not candidate_id:
+            raise ValueError(f"{label} contains a row without candidate_id")
+        if candidate_id in indexed:
+            raise ValueError(f"duplicate candidate_id in {label}: {candidate_id}")
+        indexed[candidate_id] = row
+    return indexed
+
+
+def phase_apply_replacement(data_name: str, replacement_file: Path) -> None:
+    """Replace verified evidence records using a fully revalidated JSONL plan."""
+    if not replacement_file.exists():
+        raise SystemExit(f"[apply-replacement] missing file: {replacement_file}")
+
+    plans = _load_jsonl(replacement_file)
+    if not plans:
+        raise SystemExit("[apply-replacement] replacement plan is empty")
+    _index_unique(plans, "replacement plan")
+
+    primary, reserve, _h = load_candidate_pool()
+    verified_path = STEP2_2_DIR / "verified_evidence.jsonl"
+    if not verified_path.exists():
+        raise SystemExit(f"[apply-replacement] missing file: {verified_path}")
+    verified = _load_jsonl(verified_path)
+    rejected = _load_jsonl(STEP2_2_DIR / "rejected_evidence.jsonl") if (STEP2_2_DIR / "rejected_evidence.jsonl").exists() else []
+    human_queue = _load_jsonl(STEP2_2_DIR / "human_review_queue.jsonl") if (STEP2_2_DIR / "human_review_queue.jsonl").exists() else []
+    unprocessed = _load_jsonl(STEP2_2_DIR / "unprocessed_candidates.jsonl") if (STEP2_2_DIR / "unprocessed_candidates.jsonl").exists() else []
+    superseded_path = STEP2_2_DIR / "superseded_evidence.jsonl"
+    superseded = _load_jsonl(superseded_path) if superseded_path.exists() else []
+
+    verified_by_id = _index_unique(verified, "verified evidence")
+    rejected_by_id = _index_unique(rejected, "rejected evidence")
+    human_by_id = _index_unique(human_queue, "human review queue")
+    source_by_id = dict(rejected_by_id)
+    for candidate_id, item in human_by_id.items():
+        if candidate_id in source_by_id:
+            raise SystemExit(
+                f"[apply-replacement] candidate appears in rejected and human queue: {candidate_id}"
+            )
+        source_by_id[candidate_id] = item
+
+    old_ids = []
+    new_ids = []
+    for plan in plans:
+        if plan.get("decision") != "accept":
+            raise SystemExit(
+                f"[apply-replacement] {plan.get('candidate_id')}: decision must be accept"
+            )
+        new_id = plan["candidate_id"]
+        old_id = plan.get("replaces_candidate_id")
+        if not old_id:
+            raise SystemExit(f"[apply-replacement] {new_id}: replaces_candidate_id is required")
+        if old_id not in verified_by_id:
+            raise SystemExit(f"[apply-replacement] verified candidate not found: {old_id}")
+        if new_id not in source_by_id:
+            raise SystemExit(f"[apply-replacement] replacement candidate not found: {new_id}")
+        old_ids.append(old_id)
+        new_ids.append(new_id)
+    if len(set(old_ids)) != len(old_ids):
+        raise SystemExit("[apply-replacement] duplicate replaces_candidate_id")
+    if set(new_ids) & set(verified_by_id):
+        raise SystemExit("[apply-replacement] replacement candidate is already verified")
+
+    chunk_texts, chunk_hashes, _tik = load_chunks(data_name)
+    remaining = [copy.deepcopy(item) for item in verified if item["candidate_id"] not in set(old_ids)]
+    used_chunks = {cid for item in remaining for cid in item.get("source_chunk_ids", [])}
+    replacement_by_old: Dict[str, dict] = {}
+    replacement_summary = []
+
+    for plan in plans:
+        new_id = plan["candidate_id"]
+        old_id = plan["replaces_candidate_id"]
+        old_item = verified_by_id[old_id]
+        new_item = _apply_replacement_updates(source_by_id[new_id], plan.get("updates") or {})
+        if new_item.get("intended_structure") != old_item.get("intended_structure"):
+            raise SystemExit(
+                f"[apply-replacement] structure mismatch: {old_id} -> {new_id}"
+            )
+        new_item["adjudication"] = collections.OrderedDict([
+            ("decision", "accept"),
+            ("reviewer", plan.get("reviewer")),
+            ("note", plan.get("note", "")),
+            ("replaces_candidate_id", old_id),
+        ])
+        new_item["decision"] = "accept"
+        new_item["rejection_reasons"] = []
+        problems = _refresh_replacement_record(new_item, chunk_texts, chunk_hashes)
+        if problems:
+            raise SystemExit(
+                f"[apply-replacement] {new_id} failed validation: " + "; ".join(problems)
+            )
+        collision = sorted(used_chunks & set(new_item.get("source_chunk_ids", [])))
+        if collision:
+            raise SystemExit(
+                f"[apply-replacement] {new_id} evidence cluster collision: {collision}"
+            )
+        used_chunks.update(new_item.get("source_chunk_ids", []))
+        replacement_by_old[old_id] = new_item
+        replacement_summary.append(collections.OrderedDict([
+            ("replaces_candidate_id", old_id),
+            ("candidate_id", new_id),
+            ("intended_structure", new_item["intended_structure"]),
+            ("source_chunk_ids", new_item.get("source_chunk_ids", [])),
+        ]))
+
+    final_verified = [
+        replacement_by_old.get(item["candidate_id"], copy.deepcopy(item))
+        for item in verified
+    ]
+    final_ids = [item["candidate_id"] for item in final_verified]
+    if len(final_ids) != len(set(final_ids)):
+        raise SystemExit("[apply-replacement] duplicate candidate IDs after replacement")
+    quota = collections.Counter(item["intended_structure"] for item in final_verified)
+    if len(final_verified) != sum(STRUCTURE_QUOTA.values()) or any(
+        quota.get(structure, 0) != expected
+        for structure, expected in STRUCTURE_QUOTA.items()
+    ):
+        raise SystemExit(
+            f"[apply-replacement] final quota mismatch: {dict(quota)}"
+        )
+
+    new_id_set = set(new_ids)
+    remaining_rejected = [item for item in rejected if item["candidate_id"] not in new_id_set]
+    remaining_human = [item for item in human_queue if item["candidate_id"] not in new_id_set]
+    for old_id in old_ids:
+        old_item = copy.deepcopy(verified_by_id[old_id])
+        old_item["superseded_by"] = replacement_by_old[old_id]["candidate_id"]
+        old_item["superseded_reason"] = "manual_question_quality_replacement"
+        superseded.append(old_item)
+
+    _write_finalize_outputs(
+        final_verified, remaining_rejected, remaining_human, unprocessed,
+        primary, reserve, {}, {},
+    )
+    _write_jsonl(superseded_path, superseded)
+
+    manifest_path = STEP2_2_DIR / "verification_manifest.json"
+    manifest = _read_json(manifest_path)
+    manifest["phase"] = "apply-replacement"
+    manifest["replacement_plan_hash"] = sha256_file(str(replacement_file))
+    manifest["replacements"] = replacement_summary
+    manifest["output_file_hashes"]["superseded_evidence.jsonl"] = sha256_file(
+        str(superseded_path)
+    )
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, ensure_ascii=False, indent=2)
+
+    report = collections.OrderedDict()
+    report["replacement_count"] = len(replacement_summary)
+    report["replacements"] = replacement_summary
+    report["verified_count"] = len(final_verified)
+    report["verified_quota"] = dict(quota)
+    report["quota_met"] = True
+    report["replacement_plan_hash"] = sha256_file(str(replacement_file))
+    with open(STEP2_2_DIR / "replacement_report.json", "w", encoding="utf-8") as handle:
+        json.dump(report, handle, ensure_ascii=False, indent=2)
+    print(
+        f"[apply-replacement] replacements={len(replacement_summary)} "
+        f"verified={len(final_verified)} quota_met=True"
+    )
+
 def _write_jsonl(path: Path, rows: List[dict]) -> None:
     with open(path, "w", encoding="utf-8") as f:
         for r in rows:
@@ -1067,7 +1323,8 @@ def _write_jsonl(path: Path, rows: List[dict]) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Step 2.2 证据核验与 Gold 构建")
     ap.add_argument("--phase", required=True,
-                    choices=["prepare", "draft", "review", "finalize", "apply-adjudication"])
+                    choices=["prepare", "draft", "review", "finalize",
+                             "apply-adjudication", "apply-replacement"])
     ap.add_argument("--data-name", default="neurology_chunk1000")
     ap.add_argument("--resume", action="store_true",
                     help="draft/review 阶段跳过已存在的产物")
@@ -1078,6 +1335,8 @@ def main() -> None:
                     help="candidate scope for prepare/draft/review")
     ap.add_argument("--adjudication-file", default=str(STEP2_2_DIR / "human_adjudications.jsonl"),
                     help="JSONL decisions for apply-adjudication")
+    ap.add_argument("--replacement-file", default=str(STEP2_2_DIR / "evidence_replacements.jsonl"),
+                    help="JSONL replacement plan for apply-replacement")
     ap.add_argument("--review-model", default=REVIEW_MODEL_DEFAULT)
     ap.add_argument("--review-base-url", default=os.environ.get("REVIEW_BASE_URL", ""))
     ap.add_argument("--allow-fallback-reviewer", action="store_true",
@@ -1096,6 +1355,8 @@ def main() -> None:
         phase_finalize(args.data_name, args.promote_reserve)
     elif args.phase == "apply-adjudication":
         phase_apply_adjudication(args.data_name, Path(args.adjudication_file))
+    elif args.phase == "apply-replacement":
+        phase_apply_replacement(args.data_name, Path(args.replacement_file))
 
 
 if __name__ == "__main__":
