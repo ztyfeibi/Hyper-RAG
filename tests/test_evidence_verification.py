@@ -440,6 +440,26 @@ def test_apply_replacement_swaps_and_revalidates(tmp_path, monkeypatch):
     assert manifest["quota_met"] is True
 
 
+
+
+def test_refresh_replacement_raw_source_over_cap_is_only_a_risk(monkeypatch):
+    vpe = _vpe()
+    record = _replacement_fixture_record("new", "chunk-new", "Exact source quote.")
+    counts = iter([5001, 10])
+    monkeypatch.setattr(vpe, "count_qwen_tokens", lambda _text: next(counts))
+    content_hash = ev.sha256_text("Exact source quote.")
+
+    problems = vpe._refresh_replacement_record(
+        record,
+        {"chunk-new": "Exact source quote."},
+        {"chunk-new": content_hash},
+    )
+
+    assert problems == []
+    assert record["capacity"]["p4_raw_chunk_fit"] is False
+    assert record["capacity"]["p4_gold_span_fit"] is True
+    assert record["capacity"]["retrieval_capacity_risk"] is True
+
 def test_apply_replacement_validation_failure_does_not_write(tmp_path, monkeypatch):
     vpe = _vpe()
     monkeypatch.setattr(vpe, "STEP2_2_DIR", tmp_path)

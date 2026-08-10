@@ -1131,10 +1131,6 @@ def _refresh_replacement_record(item: dict, chunk_texts: Dict[str, str],
             ("p4_gold_span_fit", span_tokens <= P4_SOURCE_CAP_QWEN),
             ("retrieval_capacity_risk", raw_tokens > P4_SOURCE_CAP_QWEN),
         ])
-        if raw_tokens > P4_SOURCE_CAP_QWEN:
-            problems.append(
-                f"raw_source_qwen_tokens={raw_tokens} > P4 cap {P4_SOURCE_CAP_QWEN}"
-            )
         if span_tokens > P4_SOURCE_CAP_QWEN:
             problems.append(
                 f"gold_span_qwen_tokens={span_tokens} > P4 cap {P4_SOURCE_CAP_QWEN}"
