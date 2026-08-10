@@ -1,0 +1,230 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "retrieval_trace_v2.schema.json",
+  "title": "Retrieval Trace v2",
+  "description": "Per-run retrieval + answer trace for the Hyper-RAG adaptive RAG benchmark. Derived from question_set_v2_frozen_design.md Section 17. Captures run-level, retriever-level, candidate-level and stage/evidence fields, plus the determinism layers used by scripts/compare_retrieval_traces.py.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "question_id",
+    "run_id",
+    "route_id",
+    "seed",
+    "system_snapshot_id",
+    "answer_text",
+    "finish_reason",
+    "retries",
+    "timeouts",
+    "stage_evidence_loss",
+    "keyword_extraction",
+    "retrievers",
+    "stages",
+    "cost",
+    "judge"
+  ],
+  "properties": {
+    "question_id": { "type": "string" },
+    "run_id": { "type": "string" },
+    "route_id": {
+      "type": "string",
+      "enum": ["P0", "P1", "P2", "P3", "P4", "adaptive", "gold"]
+    },
+    "seed": {
+      "type": ["integer", "null"],
+      "description": "Reproducible sampling seed for the repeat; null if not recorded."
+    },
+    "system_snapshot_id": { "type": "string" },
+
+    "answer_text": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Final model answer text for this run (design doc 17)."
+    },
+    "finish_reason": {
+      "type": ["string", "null"],
+      "description": "stop | length | timeout | error; null if not recorded."
+    },
+    "retries": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of retry attempts for this run."
+    },
+    "timeouts": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of timeouts observed for this run."
+    },
+    "stage_evidence_loss": {
+      "type": "object",
+      "description": "Per-stage evidence/coverage loss after truncation (design doc 17)."
+    },
+
+    "keyword_extraction": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "entity_keywords": { "type": "array", "items": { "type": "string" } },
+        "relation_keywords": { "type": "array", "items": { "type": "string" } },
+        "keyword_result_hash": { "type": "string" }
+      }
+    },
+
+    "retrievers": {
+      "type": "array",
+      "description": "One entry per retriever (chunk / entity / relation / hyper).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "retriever_id",
+          "retriever_version",
+          "query_embedding_hash",
+          "score_semantics",
+          "score_direction",
+          "score_normalization_method",
+          "score_normalization_version",
+          "candidates"
+        ],
+        "properties": {
+          "retriever_id": { "type": "string" },
+          "retriever_version": { "type": "string" },
+          "query_embedding_hash": { "type": "string" },
+          "score_semantics": { "type": ["string", "null"], "description": "Semantics of the raw retrieval score (e.g. cosine similarity). null if not recorded." },
+          "score_direction": {
+            "type": "string",
+            "enum": ["higher_is_better", "lower_is_better"]
+          },
+          "score_normalization_method": { "type": ["string", "null"], "description": "Method used to normalize raw scores; null if not recorded." },
+          "score_normalization_version": { "type": ["string", "null"], "description": "Version of the normalization method; null if not recorded." },
+          "top1_score": { "type": ["number", "null"] },
+          "top1_top2_gap": { "type": ["number", "null"] },
+          "score_mean": { "type": ["number", "null"] },
+          "score_variance": { "type": ["number", "null"] },
+          "score_entropy": { "type": ["number", "null"] },
+          "score_skewness": { "type": ["number", "null"] },
+          "candidates": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "candidate_id",
+                "candidate_type",
+                "rank",
+                "raw_retrieval_score",
+                "normalized_score",
+                "reranker_score",
+                "source_provenance_ids"
+              ],
+              "properties": {
+                "candidate_id": { "type": "string" },
+                "candidate_type": {
+                  "type": "string",
+                  "enum": ["chunk", "entity", "relation", "hyperedge"]
+                },
+                "rank": { "type": "integer", "minimum": 1 },
+                "raw_retrieval_score": { "type": "number" },
+                "normalized_score": { "type": ["number", "null"], "description": "null when not normalized; never omitted." },
+                "reranker_score": {
+                  "type": ["number", "null"],
+                  "description": "null when no reranker; never faked as 0 (design doc 17.2). Never omitted."
+                },
+                "parent_seed_id": { "type": ["string", "null"] },
+                "source_provenance_ids": {
+                  "type": ["array", "null"],
+                  "items": { "type": "string" },
+                  "description": "Source chunk/entity ids this candidate is grounded in; null if not recorded (never omitted)."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "stages": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pre_rerank_ids",
+        "post_rerank_ids",
+        "post_graph_expansion_ids",
+        "post_assembly_source_ids",
+        "final_context_source_ids",
+        "entity_ids",
+        "hyperedge_ids",
+        "tokens_before_truncation",
+        "tokens_after_truncation",
+        "truncated_tokens",
+        "evidence_group_coverage"
+      ],
+      "properties": {
+        "pre_rerank_ids": { "type": "array", "items": { "type": "string" } },
+        "post_rerank_ids": { "type": "array", "items": { "type": "string" } },
+        "post_graph_expansion_ids": { "type": "array", "items": { "type": "string" } },
+        "post_assembly_source_ids": { "type": "array", "items": { "type": "string" } },
+        "final_context_source_ids": { "type": "array", "items": { "type": "string" } },
+        "entity_ids": { "type": "array", "items": { "type": "string" } },
+        "hyperedge_ids": { "type": "array", "items": { "type": "string" } },
+        "provenance": { "type": "object" },
+        "graph_lineage": { "type": "object" },
+        "tokens_before_truncation": { "type": "integer", "minimum": 0 },
+        "tokens_after_truncation": { "type": "integer", "minimum": 0 },
+        "truncated_tokens": { "type": "integer", "minimum": 0 },
+        "evidence_group_coverage": { "type": "object" }
+      }
+    },
+
+    "cost": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input_tokens",
+        "output_tokens",
+        "retrieval_latency_ms",
+        "end_to_end_latency_ms",
+        "llm_calls",
+        "embedding_calls",
+        "reranker_calls",
+        "graph_expansion_calls",
+        "retrieved_candidate_count",
+        "gpu_seconds",
+        "api_cost"
+      ],
+      "properties": {
+        "input_tokens": { "type": "integer", "minimum": 0 },
+        "output_tokens": { "type": "integer", "minimum": 0 },
+        "retrieval_latency_ms": { "type": "number", "minimum": 0 },
+        "end_to_end_latency_ms": { "type": "number", "minimum": 0 },
+        "llm_calls": { "type": "integer", "minimum": 0 },
+        "embedding_calls": { "type": "integer", "minimum": 0 },
+        "reranker_calls": { "type": "integer", "minimum": 0 },
+        "graph_expansion_calls": { "type": "integer", "minimum": 0 },
+        "retrieved_candidate_count": { "type": "integer", "minimum": 0 },
+        "gpu_seconds": { "type": ["number", "null"], "minimum": 0, "description": "GPU seconds; null when not collectable in this deployment (never faked as 0)." },
+        "api_cost": { "type": ["number", "null"], "minimum": 0, "description": "API billing cost; null when not collectable in this deployment (never faked as 0)." }
+      }
+    },
+
+    "judge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "verdict",
+        "critical_error",
+        "evidence_sufficient",
+        "human_review_status"
+      ],
+      "properties": {
+        "verdict": { "type": "string", "enum": ["pass", "fail", "uncertain"] },
+        "critical_error": { "type": "boolean" },
+        "evidence_sufficient": { "type": "boolean" },
+        "raw_json": { "type": "object" },
+        "human_review_status": {
+          "type": "string",
+          "enum": ["pending", "reviewed", "overridden"]
+        }
+      }
+    }
+  }
+}

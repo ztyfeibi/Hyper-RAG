@@ -369,6 +369,36 @@ Do not include information where the supporting evidence for it is not provided.
 Add sections and commentary to the response as appropriate for the length and format. Style the response in markdown.
 """
 
+# Step 1.4/收尾：唯一正式回答模板。P0-P4 与 P_gold 共用此模板，保证 prompt hash 一致；
+# 不同路径的差异仅体现在 {context_data}（检索到的证据，P0 为空），而非 prompt 本身。
+# 关键修正（问题 5）：原模板要求"严格只依据表格"，使 P0（表格必空）被人为规定为失败，
+# 不再是"LLM 无检索回答能力"基线。现改为：表格为空时允许使用模型内部医学知识，
+# 但必须显式声明答案未基于提供证据 —— 既保留单一共享模板，又让 P0 成为合法基线。
+# 注意：模板字符串中不得出现除 {context_data}/{response_type} 之外的花括号，
+# 否则 .format() 会报错。
+PROMPTS["formal_answer_response"] = """---Role---
+
+You are a helpful medical assistant.
+
+---Goal---
+
+Answer the user's question based on the evidence in the data tables below when available.
+- When the data tables contain relevant evidence, base your answer primarily on them and reflect what the evidence shows.
+- When the data tables are empty or lack enough evidence, you MAY answer using your general medical knowledge, but you MUST explicitly state that the answer is not grounded in the provided evidence (e.g. "Note: the provided evidence was empty; the following relies on general medical knowledge.").
+- Do not present information that contradicts the provided evidence.
+- If you genuinely cannot answer, say so plainly.
+
+---Target response length and format---
+
+{response_type}
+
+---Data tables---
+
+{context_data}
+
+Add sections and commentary to the response as appropriate for the length and format. Style the response in markdown.
+"""
+
 PROMPTS["keywords_extraction"] = """---Role---
 
 You are a helpful assistant tasked with identifying both high-level and low-level keywords in the user's query.
@@ -442,4 +472,37 @@ Through the existing analysis, we can know that the potential keywords or theme 
 {{ {ll_keywords} | {hl_keywords} }}
 Please refer to keywords or theme information, combined with your own analysis, to select useful and relevant information from the prompts to help you answer accurately.
 Attention: Don't brainlessly splice knowledge items! The answer needs to be as accurate, detailed, comprehensive, and convincing as possible!
+"""
+
+PROMPTS["query_router"] = """---Role---
+You are a medical query analyzer. Your task is to classify a medical question into a structured route.
+
+---Goal---
+Analyze the given question and output a JSON object with the following fields:
+
+1. "query_type": one of "factual", "relation", "mechanism", "comparison", "complex"
+   - factual: asks for a definition, symptom, or single-point fact (e.g., "What is multiple sclerosis?")
+   - relation: asks about the relationship/association between A and B (e.g., "What is the relationship between hypertension and stroke?")
+   - mechanism: asks about a pathological mechanism, process, or "why" (e.g., "How does the blood-brain barrier work?")
+   - comparison: asks about differences, comparisons, pros/cons (e.g., "What is the difference between Alzheimer's and vascular dementia?")
+   - complex: multi-condition, multi-hop, or comprehensive reasoning (e.g., "What treatments are available for a patient with both epilepsy and depression?")
+
+2. "complexity": one of "simple", "medium", "complex"
+   - simple: single entity, direct lookup, no reasoning chain
+   - medium: requires connecting 2-3 entities or one reasoning step
+   - complex: multi-hop reasoning, multiple conditions, or broad synthesis
+
+3. "focus_types": a list of strings from ["entity", "relation", "mechanism", "text"]
+   - entity: the answer primarily needs entity-level facts
+   - relation: the answer primarily needs relationships between entities
+   - mechanism: the answer primarily needs process/mechanism descriptions
+   - text: the answer primarily needs source text passages
+
+4. "reason": a brief one-sentence explanation of your classification
+
+---Output Format---
+Output ONLY a valid JSON object, no markdown, no explanation outside the JSON.
+
+---Question---
+{query}
 """

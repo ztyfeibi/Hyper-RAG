@@ -31,7 +31,7 @@ logging.basicConfig(
 # 配置（环境变量）
 # =============================================================================
 DATA_NAME = os.getenv("HYPERRAG_DATA_NAME", "pathology").strip()
-MODE = os.getenv("HYPERRAG_MODE", "hyper").strip()  # hyper | hyper-lite | naive | llm
+MODE = os.getenv("HYPERRAG_MODE", "hyper").strip()  # hyper | hyper-lite | adaptive | naive | llm
 MAX_QPS = float(os.getenv("HYPERRAG_MAX_QPS", "3").strip() or "3")
 API_KEY = os.getenv("HYPERRAG_API_KEY", "").strip()
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("HYPERRAG_ALLOWED_ORIGINS", "*").split(",")]
@@ -75,7 +75,7 @@ query_param: Optional[QueryParam] = None
 # =============================================================================
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=6000)
-    mode: Optional[str] = Field(default=None, description="覆盖默认模式：hyper / hyper-lite / naive / llm")
+    mode: Optional[str] = Field(default=None, description="覆盖默认模式：hyper / hyper-lite / adaptive / naive / llm")
 
 
 class QueryResponse(BaseModel):
@@ -185,8 +185,8 @@ async def query(
         raise HTTPException(status_code=503, detail="服务尚未就绪，请稍后重试。")
 
     mode = (req.mode or MODE).strip()
-    if mode not in {"hyper", "hyper-lite", "naive", "llm"}:
-        raise HTTPException(status_code=400, detail="mode 参数非法：hyper / hyper-lite / naive / llm")
+    if mode not in {"hyper", "hyper-lite", "adaptive", "naive", "llm"}:
+        raise HTTPException(status_code=400, detail="mode 参数非法：hyper / hyper-lite / adaptive / naive / llm")
 
     qp = QueryParam(mode=mode)
 
@@ -219,8 +219,8 @@ async def query_stream(
         raise HTTPException(status_code=503, detail="服务尚未就绪，请稍后重试。")
 
     mode = (req.mode or MODE).strip()
-    if mode not in {"hyper", "hyper-lite", "naive", "llm"}:
-        raise HTTPException(status_code=400, detail="mode 参数非法：hyper / hyper-lite / naive / llm")
+    if mode not in {"hyper", "hyper-lite", "adaptive", "naive", "llm"}:
+        raise HTTPException(status_code=400, detail="mode 参数非法：hyper / hyper-lite / adaptive / naive / llm")
 
     qp = QueryParam(mode=mode)
 

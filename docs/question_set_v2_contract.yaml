@@ -1,0 +1,302 @@
+# =============================================================================
+# Question Set v2.1 — Experiment Contract (machine-readable frozen spec)
+# -----------------------------------------------------------------------------
+# This file is the SINGLE SOURCE OF TRUTH for experiment configuration.
+# All downstream runners, judges, routers and analysis scripts MUST read
+# experiment parameters from this contract (or its referenced schemas),
+# never from hard-coded literals scattered across code.
+#
+# It is versioned together with:
+#   - docs/schema/question_item_v2.schema.json   (per-question gold schema)
+#   - docs/schema/retrieval_trace_v2.schema.json (per-run trace schema)
+#
+# Editing any of the following REQUIRES a version bump and a new dataset
+# version per question_set_v2_frozen_design.md Section 1 / 16:
+#   core definitions, policy config, success criteria, cost config,
+#   data split rules, schema versions.
+# =============================================================================
+
+contract_version: question-set-v2.1-contract-v1
+trace_schema_version: retrieval-trace-v2
+success_rule_version: operational-stable-success-v1
+metric_version: evidence-metrics-v1
+cost_schema_version: route-cost-v1
+schema_owner:
+  question_item: docs/schema/question_item_v2.schema.json
+  retrieval_trace: docs/schema/retrieval_trace_v2.schema.json
+created: 2026-07-29
+references:
+  - question_set_v2_frozen_design.md
+
+# -----------------------------------------------------------------------------
+# 1. Global units & system boundary
+# -----------------------------------------------------------------------------
+units:
+  token_unit: qwen_tokenizer_token
+  token_calibration:
+    - tiktoken-gpt-4o-mini   # approximate baseline only
+    - qwen_tokenizer         # authoritative for final hard cap
+    - api_usage_prompt_tokens  # if available from the serving API
+  note: >
+    All budget values are expressed in Qwen tokenizer tokens. tiktoken
+    counts are ONLY an approximation and MUST be calibrated against the Qwen
+    tokenizer or API usage before claiming hard-cap compliance. All budget
+    matching experiments MUST report actual Qwen context token counts, not
+    merely the configured values.
+
+system_boundary:
+  answer_model: qwen-27b-int4
+  embedding_model: qwen-8b-embed
+  judge_model: meituan-longcat/LongCat-2.0
+  llm_max_length: 24576
+  temperature: 0.1
+  max_response_tokens: 3000   # frozen 2026-07-29; aligns with code Step 5.3.
+  router: disabled            # for fixed-strategy labeling runs (P0..P4)
+  type_aware_weighting: disabled
+  llm_response_cache: disabled  # for formal repeated labeling runs
+
+discrepancy_notes:
+  - id: D1-max-response-tokens
+    field: system_boundary.max_response_tokens
+    resolution: 3000
+    resolved_on: 2026-07-29
+    status: RESOLVED
+    note: >
+      Execution plan step 2 said "keep existing max_response_tokens=3000"
+      (matches code Step 5.3). The frozen design doc Section 6.2 originally
+      said 1200. User confirmed 3000 on 2026-07-29; design doc 6.2 updated to
+      match. No longer a conflict.
+
+# -----------------------------------------------------------------------------
+# 2. Frozen policy ladder P0..P4 (fixed-strategy labeling)
+# -----------------------------------------------------------------------------
+policy_ladder:
+  semantics: >
+    P0 < P1 < P2 < P3 < P4 is a PREDEFINED capability/resource ladder defined
+    by researchers. It is NOT a guaranteed real-cost total order. The first
+    configuration in this order that satisfies the operational success rule is
+    `minimum_sufficient_route_by_policy`. It must NOT be called
+    `minimum_cost_route`, and must NOT alone be used to claim hypergraph
+    necessity.
+  stages: [P0, P1, P2, P3, P4]
+  # --- candidate budget: VDB candidate top-k ---
+  candidate_budget:
+    chunk_vdb_top_k:    [0, 20, 0, 0, 0]
+    entity_vdb_top_k:   [0, 0, 25, 30, 50]
+    relation_vdb_top_k: [0, 0, 0, 30, 50]
+  # --- pre-merge caps, per active retrieval line, before merge ---
+  pre_merge_caps:
+    entity_description_cap:   [0, 0, 150, 250, 350]
+    relation_description_cap: [0, 0, 800, 1200, 1800]
+    source_text_cap:          [0, 4000, 2000, 3000, 4000]
+  # --- post-merge hard control ---
+  post_merge_hard_control:
+    section_allocation_ratios:   # only used when merged context exceeds the cap
+      Sources: 0.55
+      Relationships: 0.30
+      Entities: 0.15
+    final_context_hard_cap:      [0, 4000, 7000, 12000, 15000]
+  notes:
+    - "final_context_hard_cap limits ONLY the retrieved context, NOT the prompt or the answer."
+    - "P2 relation_vdb_top_k=0 means Relation VDB is not queried directly, but entity seeds still expand adjacent hyperedges, so relation_description_cap=800 stays effective."
+    - "The 55/30/15 split is ONLY a post-merge over-budget allocation ratio, NOT an independent budget."
+    - "P0..P4 MUST share one unified final-answer prompt; the only allowed difference is whether context exists and its retrieval source/structure."
+
+# -----------------------------------------------------------------------------
+# 3. Frozen label semantics
+# -----------------------------------------------------------------------------
+label_semantics:
+  required_outputs:
+    - successful_route_set
+    - minimum_sufficient_route_by_policy
+    - route_cost_vectors
+    - pareto_optimal_routes
+    - minimum_cost_route_by_profile
+  forbidden_terms:
+    - minimum_successful_route   # ambiguous; replaced by the two explicit fields above
+  definitions:
+    successful_route_set: >
+      Set of routes (among P0..P4) that are operationally successful for the
+      question under the operational_stable_success_v1 rule.
+    minimum_sufficient_route_by_policy: >
+      First configuration in the predefined P0..P4 order that is operationally
+      successful. Predefined-policy order ONLY; not a cost claim.
+    minimum_cost_route_by_profile: >
+      Computed ONLY after an explicit deployment cost profile is declared
+      (token_first / latency_first / local_gpu / api_billing). Never computed
+      without a profile.
+    route_cost_vectors: >
+      Per-route raw cost vector (see cost_vector.raw_fields) recorded on every run.
+    pareto_optimal_routes: >
+      Routes for which no other operationally-successful route dominates on
+      every cost component with at least one component strictly lower.
+
+# -----------------------------------------------------------------------------
+# 4. Frozen cost definition
+# -----------------------------------------------------------------------------
+cost_vector:
+  raw_fields:
+    - input_tokens
+    - output_tokens
+    - retrieval_latency_ms
+    - end_to_end_latency_ms
+    - llm_calls
+    - embedding_calls
+    - reranker_calls
+    - graph_expansion_calls
+    - retrieved_candidate_count
+    - gpu_seconds
+    - api_cost
+  derived:
+    - pareto_optimal_routes
+    - minimum_cost_route_by_profile
+  cost_profiles:
+    - token_first     # minimize total tokens
+    - latency_first   # minimize end-to-end latency
+    - local_gpu       # minimize GPU seconds
+    - api_billing     # minimize actual API cost
+  aggregation:
+    method: per_component_median_across_repeats
+    note: >
+      Each route aggregates its REPEAT runs into a single summary cost vector
+      by taking the per-component MEDIAN (frozen 2026-07-29). A cost component
+      absent from EVERY repeat run is recorded as null (unavailable) and is
+      NEVER defaulted to 0. A route with any null component has an INCOMPLETE
+      cost vector.
+  pareto_rule:
+    requires_complete_cost_vector: true
+    dominates: "a <= b on all 11 components AND a < b on at least one"
+    incomplete_cost: >
+      Routes with an incomplete (any-null) cost vector are EXCLUDED from
+      pareto_optimal_routes -- they must never be declared cheaper than a
+      fully-measured route. They remain counted in successful_route_set.
+  forbidden:
+    - a single hand-weighted "universal cost function"  # must not be defined
+
+# -----------------------------------------------------------------------------
+# 5. Frozen evidence & evaluation metrics
+# -----------------------------------------------------------------------------
+evidence:
+  unit: evidence_group
+  composition: "intra-group OR, inter-group AND"
+  group_alternatives: "a group may carry multiple equivalent source chunk_ids"
+  relevance_pooling: "union of all candidate retriever top results"
+  unjudged_policy: "unjudged results MUST NOT be treated as irrelevant"
+  qrels_levels: [0, 1, 2]   # 0=irrelevant, 1=relevant background, 2=directly supports answer unit
+
+metrics:
+  primary:
+    - ER-Recall@1
+    - ER-Recall@3
+    - ER-Recall@5
+    - ER-Recall@10
+    - ER-Recall@20
+    - CompleteEvidenceHit@1
+    - CompleteEvidenceHit@3
+    - CompleteEvidenceHit@5
+    - CompleteEvidenceHit@10
+    - CompleteEvidenceHit@20
+    - CompleteEvidenceRank
+    - AnswerUnitRecall@k
+    - ContextPrecision
+    - EvidenceTokenDensity
+    - TruncationLoss
+  metric_aliases_forbidden:
+    - "Call@k"   # use Recall@k or ER-Recall@k instead
+  k_report_defaults: [1, 3, 5, 10, 20]
+
+# -----------------------------------------------------------------------------
+# 6. Frozen stability & judge rules
+# -----------------------------------------------------------------------------
+stability_rule:
+  version: operational-stable-success-v1
+  temperature: 0.1
+  llm_response_cache: disabled   # for formal repeated runs
+  trials_initial: 3
+  decision:
+    - "3 trials : 3/3 -> success ; 0/3, 1/3 -> fail ; 2/3 -> undecided (run 2 more)"
+    - "5 trials : 4/5, 5/5 -> success ; 0/5..3/5 -> fail"
+    - "10 trials (locked-test boundary) : 8/10..10/10 -> success ; 0/10..7/10 -> fail"
+    - "any other trial count -> undecided (None); route NOT counted until a defined stopping point is reached"
+  locked_test_boundary_runs: 10
+  success_definition: "source_evidence_coverage AND answer_correctness"
+  judge:
+    model: meituan-longcat/LongCat-2.0
+    temperature: 0
+    output: "strict JSON: verdict, answer_units, unsupported_claims, critical_error, evidence_sufficient"
+    human_review: "retained for uncertain / unsupported / critical_error / contradictory"
+
+# -----------------------------------------------------------------------------
+# 7. Trace schema reference
+# -----------------------------------------------------------------------------
+trace_schema:
+  version: retrieval-trace-v2
+  file: docs/schema/retrieval_trace_v2.schema.json
+  reranker_null_policy: "when no reranker exists, reranker_score = null; never faked as 0"
+  run_level_fields:
+    - question_id
+    - run_id
+    - route_id
+    - seed
+    - system_snapshot_id
+    - answer_text
+    - finish_reason
+    - retries
+    - timeouts
+    - stage_evidence_loss
+  retriever_level_fields:
+    - retriever_id
+    - retriever_version
+    - query_embedding_hash
+    - score_semantics
+    - score_direction
+    - score_normalization_method
+    - raw_retrieval_scores
+    - normalized_scores
+  candidate_level_fields:
+    - candidate_id
+    - candidate_type
+    - rank
+    - raw_retrieval_score
+    - normalized_score
+    - reranker_score
+    - parent_seed_id
+    - source_provenance_ids
+  stage_evidence_fields:
+    - pre_rerank_ids
+    - post_rerank_ids
+    - post_graph_expansion_ids
+    - post_assembly_source_ids
+    - final_context_source_ids
+    - entity_ids
+    - hyperedge_ids
+    - provenance
+    - graph_lineage
+    - tokens_before_truncation
+    - tokens_after_truncation
+    - truncated_tokens
+    - evidence_group_coverage
+  determinism_layers:   # compatible superset of scripts/compare_retrieval_traces.py TRACE_FIELDS
+    - entity_keywords
+    - relation_keywords
+    - keyword_result_hash
+    - entity_query_embedding_hash
+    - relation_query_embedding_hash
+    - entity_vdb_ids
+    - entity_post_graph_ids
+    - entity_post_truncate_ids
+    - entity_line_relation_ids
+    - entity_line_chunk_ids
+    - relation_vdb_ids
+    - relation_post_filter_ids
+    - relation_post_truncate_ids
+    - relation_line_entity_ids
+    - relation_line_chunk_ids
+    - merged_chunk_ids
+    - context_tokens
+    - context_tokens_before_truncate
+    - context_truncated
+    - context_hash
+    - route
+    - router_policy
+    - effective_params

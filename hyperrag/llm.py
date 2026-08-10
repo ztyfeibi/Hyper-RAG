@@ -10,6 +10,7 @@
 
 import os
 import copy
+import time
 from functools import lru_cache
 import json
 import aioboto3
@@ -65,6 +66,14 @@ async def openai_complete_if_cache(
         AsyncOpenAI() if base_url is None else AsyncOpenAI(base_url=base_url)
     )
     hashing_kv: BaseKVStorage = kwargs.pop("hashing_kv", None)
+    # Step 1 收尾：真实 token 用量旁路。由正式运行 runner 传入一个 dict，
+    # 调用结束后填入 prompt_tokens / completion_tokens / latency_ms。
+    # 必须在使用 kwargs 调 API 之前 pop 掉，否则会传给 OpenAI client 报错。
+    usage_collector = kwargs.pop("_record_usage_into", None)
+    # Step 1 收尾（问题 3）：finish_reason 旁路。契约 trace 要求上报
+    # stop / length / timeout / error；此前全链路未采集导致六条路径全 null。
+    # 同样必须在调 API 前 pop 掉。
+    finish_collector = kwargs.pop("_record_finish_reason_into", None)
     # OpenAI chat API 的标准 messages 结构：system -> history -> user。
     messages = []
     if system_prompt is not None:
@@ -72,17 +81,53 @@ async def openai_complete_if_cache(
     messages.extend(history_messages)
     messages.append({"role": "user", "content": prompt})
     if hashing_kv is not None:
-        # 缓存 key 与模型名和完整 messages 相关，避免不同 prompt 互相污染。
-        args_hash = compute_args_hash(model, messages)
+        # Include inference params (max_tokens, temperature, top_p) in cache key
+        # to prevent stale cache hits when these params change.
+        cache_key_params = {
+            k: kwargs[k] for k in ("max_tokens", "temperature", "top_p")
+            if k in kwargs
+        }
+        args_hash = compute_args_hash(model, messages, cache_key_params)
         if_cache_return = await hashing_kv.get_by_id(args_hash)
         if if_cache_return is not None:
+            # 缓存命中：无 usage 可得，如实记 None（绝不伪造 tokens）。
+            if usage_collector is not None:
+                usage_collector["prompt_tokens"] = None
+                usage_collector["completion_tokens"] = None
+                usage_collector["latency_ms"] = None
+            # 缓存命中同样拿不到 finish_reason —— 如实记 None，绝不伪造 "stop"。
+            if finish_collector is not None:
+                finish_collector["finish_reason"] = None
+                finish_collector["from_cache"] = True
             return if_cache_return["return"]
 
-    response = await openai_async_client.chat.completions.create(
-        model=model, messages=messages,
-        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-        **kwargs
-    )
+    _t0 = time.perf_counter()
+    try:
+        response = await openai_async_client.chat.completions.create(
+            model=model, messages=messages,
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            **kwargs
+        )
+    except Exception:
+        # 调用失败也要如实记录终止原因，再把异常上浮（不吞错）。
+        if finish_collector is not None:
+            finish_collector["finish_reason"] = "error"
+            finish_collector["from_cache"] = False
+        raise
+    _latency_ms = (time.perf_counter() - _t0) * 1000.0
+
+    if finish_collector is not None:
+        _choices = getattr(response, "choices", None) or []
+        finish_collector["finish_reason"] = (
+            getattr(_choices[0], "finish_reason", None) if _choices else None
+        )
+        finish_collector["from_cache"] = False
+
+    if usage_collector is not None and getattr(response, "usage", None) is not None:
+        usage = response.usage
+        usage_collector["prompt_tokens"] = getattr(usage, "prompt_tokens", None)
+        usage_collector["completion_tokens"] = getattr(usage, "completion_tokens", None)
+        usage_collector["latency_ms"] = _latency_ms
 
     if hashing_kv is not None:
         # 只缓存最终文本，不缓存完整响应对象。
@@ -125,7 +170,11 @@ async def openai_complete_stream_if_cache(
 
     # 1) cache 命中：直接回放
     if hashing_kv is not None:
-        args_hash = compute_args_hash(model, messages)
+        cache_key_params = {
+            k: kwargs[k] for k in ("max_tokens", "temperature", "top_p")
+            if k in kwargs
+        }
+        args_hash = compute_args_hash(model, messages, cache_key_params)
         if_cache_return = await hashing_kv.get_by_id(args_hash)
         if if_cache_return is not None:
             cached = if_cache_return["return"] or ""
@@ -191,7 +240,11 @@ async def azure_openai_complete_if_cache(
     if prompt is not None:
         messages.append({"role": "user", "content": prompt})
     if hashing_kv is not None:
-        args_hash = compute_args_hash(model, messages)
+        cache_key_params = {
+            k: kwargs[k] for k in ("max_tokens", "temperature", "top_p")
+            if k in kwargs
+        }
+        args_hash = compute_args_hash(model, messages, cache_key_params)
         if_cache_return = await hashing_kv.get_by_id(args_hash)
         if if_cache_return is not None:
             return if_cache_return["return"]
@@ -273,7 +326,11 @@ async def bedrock_complete_if_cache(
 
     hashing_kv: BaseKVStorage = kwargs.pop("hashing_kv", None)
     if hashing_kv is not None:
-        args_hash = compute_args_hash(model, messages)
+        cache_key_params = {
+            k: kwargs[k] for k in ("max_tokens", "temperature", "top_p")
+            if k in kwargs
+        }
+        args_hash = compute_args_hash(model, messages, cache_key_params)
         if_cache_return = await hashing_kv.get_by_id(args_hash)
         if if_cache_return is not None:
             return if_cache_return["return"]

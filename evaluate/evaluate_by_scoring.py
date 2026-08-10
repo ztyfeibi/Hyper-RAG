@@ -211,13 +211,37 @@ if __name__ == "__main__":
         choices=(1, 2, 3),
         help="问题阶段，对应 <n>_stage.json",
     )
+    parser.add_argument(
+        "--question-file",
+        type=str,
+        default=None,
+        help="问题文件名前缀（不含 .json），如 2_stage / mixed_stage。"
+             "默认根据 --question-stage 自动生成",
+    )
+    parser.add_argument(
+        "--output-suffix",
+        type=str,
+        default=None,
+        help="输入/输出文件后缀，如 fixed_medium / oracle。"
+             "不加时行为与之前一致（对应 Step_3 不加 --output-suffix）",
+    )
     args = parser.parse_args()
     data_name = args.data_name
-    mode, question_stage = args.mode, args.question_stage
+    mode = args.mode
+
+    # 确定问题文件前缀
+    if args.question_file:
+        question_prefix = args.question_file
+    else:
+        question_prefix = f"{args.question_stage}_stage"
+
     WORKING_DIR = Path("caches") / data_name
     RESPONSE_DIR = WORKING_DIR / "response"
-    question_file_path = WORKING_DIR / "questions" / f"{question_stage}_stage.json"
-    answer_file_path = RESPONSE_DIR / f"{mode}_{question_stage}_stage_result.json"
+    question_file_path = WORKING_DIR / "questions" / f"{question_prefix}.json"
+
+    # 有 suffix 时，Step_3 输出文件名为 {mode}_{prefix}_{suffix}_result.json
+    suffix = f"_{args.output_suffix}" if args.output_suffix else ""
+    answer_file_path = RESPONSE_DIR / f"{mode}_{question_prefix}{suffix}_result.json"
 
     # extract questions, answers and references
     raw_queries, raw_refs = extract_queries_and_refs(question_file_path)
@@ -232,13 +256,13 @@ if __name__ == "__main__":
     # save the results to a JSON file
     OUT_DIR = WORKING_DIR / "evalation"
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    output_file_path = OUT_DIR / f"scoring_{question_stage}_stage_question_{mode}.json"
+    output_file_path = OUT_DIR / f"scoring_{question_prefix}{suffix}_question_{mode}.json"
     with open(output_file_path, "w", encoding="utf-8") as f:
         json.dump(responses, f, indent=4)
     print(f"Scoring-based evaluation results written to {output_file_path}\n\n")
 
     # calculate the scores
     print(
-        f"Scoring-based evaluation for {question_stage}-stage questions of {mode} model:"
+        f"Scoring-based evaluation for {question_prefix}{suffix} questions of {mode} model:"
     )
     fetch_scoring_results(responses)

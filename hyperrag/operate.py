@@ -36,6 +36,7 @@ from .query_context import (
     remove_after_sources,
 )
 from .query_modes import (
+    adaptive_query,
     graph_query,
     hyper_query,
     hyper_query_lite,
@@ -50,6 +51,7 @@ from .query_stream import (
 )
 
 __all__ = [
+    "adaptive_query",
     "chunking_by_token_size",
     "extract_entities",
     "hyper_query",

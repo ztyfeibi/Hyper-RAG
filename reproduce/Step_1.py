@@ -55,7 +55,7 @@ async def embedding_func(texts: list[str]) -> np.ndarray:
     )
 
 
-def insert_text(rag, file_path, retries=0, max_retries=3, limit=None):
+def insert_text(rag, file_path, retries=0, max_retries=3, limit=None, batch_size=None):
     """读取 Step_0 生成的 context 文件，并调用 HyperRAG.insert 建索引。
 
     file_path 默认形如：
@@ -68,32 +68,68 @@ def insert_text(rag, file_path, retries=0, max_retries=3, limit=None):
     4. 写入实体向量库、关系向量库和 hypergraph hgdb 文件。
 
     limit: 若不为 None，只取前 limit 条 context 拼成文本，用于小规模冒烟测试。
-    """
-    if limit is not None:
-        # 小规模测试模式：json.load 取前 limit 条 context 拼接
-        with open(file_path, "r", encoding="utf-8") as f:
-            contexts = json.load(f)
-        contexts = contexts[:limit]
-        unique_contexts = "".join(contexts)
-        print(f"[Smoke test] Using first {limit} contexts "
-              f"({len(unique_contexts)} chars)")
-    else:
-        with open(file_path, "r", encoding="utf-8") as f:
-            unique_contexts = f.read()
 
-    while retries < max_retries:
-        try:
-            # 这是本脚本最关键的一行：真正进入 hyperrag/ 方法本体。
-            rag.insert(unique_contexts)
-            break
-        except Exception as e:
-            # 建库阶段会访问外部 LLM/embedding 服务，可能遇到限流或临时网络错误。
-            # 这里用简单重试避免一次失败直接中断整条复现流水线。
-            retries += 1
-            print(f"Insertion failed, retrying ({retries}/{max_retries}), error: {e}")
-            time.sleep(30)
-    if retries == max_retries:
-        print("Insertion failed after exceeding the maximum number of retries")
+    batch_size: 若不为 None，将 context 列表分批插入，每批 batch_size 条。
+    分批插入可避免一次性处理过多 chunk 导致内存溢出（2317 chunk 全量会崩）。
+    每批结束后 HyperRAG 自动落盘（_insert_done），崩溃只丢当前批。
+    断点续跑：已处理的 doc/chunk 会被 filter_keys 自动跳过。
+    """
+    with open(file_path, "r", encoding="utf-8") as f:
+        contexts = json.load(f)
+
+    if limit is not None:
+        contexts = contexts[:limit]
+        print(f"[Smoke test] Using first {limit} contexts")
+
+    if batch_size is None:
+        # 不分批：全部拼成一个字符串，单次 insert（仅适用于小规模）
+        unique_contexts = "".join(contexts)
+        print(f"Inserting {len(contexts)} contexts as single doc "
+              f"({len(unique_contexts)} chars)")
+        while retries < max_retries:
+            try:
+                rag.insert(unique_contexts)
+                break
+            except Exception as e:
+                retries += 1
+                print(f"Insertion failed, retrying ({retries}/{max_retries}), error: {e}")
+                time.sleep(30)
+        if retries == max_retries:
+            raise RuntimeError(
+                f"Insertion failed after {max_retries} retries; "
+                "stop to avoid producing an incomplete cache"
+            )
+    else:
+        # 分批插入：每批 batch_size 条 context，独立 insert + 落盘
+        total_batches = (len(contexts) + batch_size - 1) // batch_size
+        print(f"[Batch mode] {len(contexts)} contexts -> {total_batches} batches "
+              f"({batch_size} contexts/batch)")
+        for i in range(0, len(contexts), batch_size):
+            batch_num = i // batch_size + 1
+            batch_contexts = contexts[i:i + batch_size]
+            batch_text = "".join(batch_contexts)
+            print(f"\n{'='*60}")
+            print(f"[Batch {batch_num}/{total_batches}] {len(batch_contexts)} contexts, "
+                  f"{len(batch_text)} chars")
+            print(f"{'='*60}")
+            while retries < max_retries:
+                try:
+                    rag.insert(batch_text)
+                    break
+                except Exception as e:
+                    retries += 1
+                    print(f"Batch {batch_num} failed, retrying "
+                          f"({retries}/{max_retries}), error: {e}")
+                    time.sleep(30)
+            if retries == max_retries:
+                raise RuntimeError(
+                    f"Batch {batch_num} failed after {max_retries} retries; "
+                    "stop to avoid producing an incomplete cache"
+                )
+            retries = 0  # reset for next batch
+        print(f"\n{'='*60}")
+        print(f"All {total_batches} batches completed")
+        print(f"{'='*60}")
 
 
 if __name__ == "__main__":
@@ -110,8 +146,43 @@ if __name__ == "__main__":
         default=None,
         help="只取前 N 条 context 做小规模冒烟测试（默认全量）",
     )
+    parser.add_argument(
+        "--source-data-name",
+        type=str,
+        default=None,
+        help="读取 context 文件的 data_name（默认与 --data-name 相同）。"
+             "用于重建 chunk 时复用已有 context 文件，例如"
+             " --data-name=neurology_chunk1000 --source-data-name=neurology",
+    )
+    parser.add_argument(
+        "--chunk-token-size",
+        type=int,
+        default=2400,
+        help="每个 chunk 的 token 上限（默认 2400）",
+    )
+    parser.add_argument(
+        "--chunk-overlap-token-size",
+        type=int,
+        default=120,
+        help="相邻 chunk 之间的重叠 token 数（默认 120）",
+    )
+    parser.add_argument(
+        "--gleaning",
+        type=int,
+        default=0,
+        help="实体抽取最大 gleaning 轮数（默认 0，即关闭）",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="分批插入的 context 条数（默认 None=不分批）。"
+             "全量 chunk=1000 时 2317 chunk 一次性处理会内存溢出，"
+             "建议设 3000（约 580 chunk/批，4-5 批）",
+    )
     args = parser.parse_args()
     data_name = args.data_name
+    source_data_name = args.source_data_name or data_name
 
     # HyperRAG 的所有持久化产物都会落在这个目录下：
     # kv_store_full_docs.json、kv_store_text_chunks.json、vdb_*.json、
@@ -127,21 +198,19 @@ if __name__ == "__main__":
         embedding_func=EmbeddingFunc(
             embedding_dim=EMB_DIM, max_token_size=8192, func=embedding_func
         ),
-        # 更大的 chunk 会减少 chunk 数量，从而降低全量 Neurology 建库时
-        # 实体/超边抽取所需的 LLM 调用次数。
-        chunk_token_size=2400,
-        chunk_overlap_token_size=120,
+        chunk_token_size=args.chunk_token_size,
+        chunk_overlap_token_size=args.chunk_overlap_token_size,
         # 内网 vLLM 无 429 限流风险，适度提高并发加速建库
         llm_model_max_async=4,
         embedding_func_max_async=4,
-        # 禁用 gleaning：qwen-27b 24K context 不足以容纳 history + continue_prompt
-        # 几乎所有 gleaning 调用都因 context 超长失败，跑 864 轮白白浪费 5+ 小时
-        entity_extract_max_gleaning=0,
+        entity_extract_max_gleaning=args.gleaning,
     )
 
     # 读取 Step_0 的输出，并开始构建 HyperRAG 所需的全部索引和超图数据。
     insert_text(
         rag,
-        f"caches/{data_name}/contexts/{data_name}_unique_contexts.json",
+        f"caches/{source_data_name}/contexts/{source_data_name}_unique_contexts.json",
         limit=args.limit,
+        batch_size=args.batch_size,
     )
+

@@ -212,15 +212,23 @@ def is_float_regex(value):
     return bool(re.match(r"^[-+]?[0-9]*\.?[0-9]+$", value))
 
 
-def truncate_list_by_token_size(list_data: list, key: callable, max_token_size: int):
-    """按 token 总量截断列表，避免拼给 LLM 的上下文过长。"""
+def truncate_list_by_token_size(
+    list_data: list, key: callable, max_token_size: int,
+    model_name: str = "gpt-4o-mini",
+):
+    """按 token 总量截断列表，避免拼给 LLM 的上下文过长。
+
+    ``model_name`` 默认与 tokenizer 校准脚本（``scripts/calibrate_tokenizers.py``
+    的 ``TIKTOKEN_MODEL_NAME``）保持一致：否则"按校准换算出的预算"与"实际计数
+    用的编码器"口径不同，Qwen->tiktoken 的保守转换保证就失效了。
+    """
     if max_token_size <= 0:
         return []
     if not list_data:
         return []
     tokens = 0
     for i, data in enumerate(list_data):
-        tokens += len(encode_string_by_tiktoken(key(data)))
+        tokens += len(encode_string_by_tiktoken(key(data), model_name=model_name))
         if tokens > max_token_size:
             # 至少保留第一个元素，避免单个元素就超预算时返回空列表
             return list_data[:max(1, i)]
@@ -335,11 +343,17 @@ def process_combine_contexts(hl, ll):
     if list_ll:
         list_ll = [",".join(item[1:]) for item in list_ll if item]
 
-    combined_sources_set = set(filter(None, list_hl + list_ll))
+    # 去重但保留首次出现顺序（避免 set 迭代序随 PYTHONHASHSEED 抖动导致 context 字符串不稳定）
+    seen = set()
+    combined_ordered = []
+    for item in filter(None, list_hl + list_ll):
+        if item not in seen:
+            seen.add(item)
+            combined_ordered.append(item)
 
     combined_sources = [",\t".join(header)]
 
-    for i, item in enumerate(combined_sources_set, start=1):
+    for i, item in enumerate(combined_ordered, start=1):
         combined_sources.append(f"{i},\t{item}")
 
     combined_sources = "\n".join(combined_sources)

@@ -85,7 +85,7 @@ question_prompt = {
             6. The question should be based on the complete context, ensuring clarity for the respondent.
             7. State the question directly in a single sentence, without introductory phrases like "How in this reference?" or "What about this data set?".
             ################
-            Output the content of the question in the following structure:
+            Output the content of question in the following structure:
             {{
             "Question": [question description],
             }}
@@ -108,12 +108,16 @@ question_prompt = {
             6. The question should be based on the complete context, ensuring clarity for the respondent.
             7. State the question directly in a single sentence, without introductory phrases like "How in this reference?" or "What about this data set?".
             ################
-            Output the content of the question in the following structure:
+            Output the content of question in the following structure:
             {{
             "Question": [question description],
             }}
         """,
 }
+
+# Stage to expected complexity mapping (used in meta files)
+STAGE_COMPLEXITY_MAP = {1: "simple", 2: "medium", 3: "complex"}
+STAGE_STRATEGY_MAP = {1: "source_entity", 2: "entity_relation", 3: "multi_hop_reasoning"}
 
 
 if __name__ == "__main__":
@@ -124,11 +128,41 @@ if __name__ == "__main__":
         default=DEFAULT_DATA_NAME,
         help=f"读取 caches/<name>/contexts（默认 {DEFAULT_DATA_NAME!r}）",
     )
+    parser.add_argument(
+        "--stage",
+        type=int,
+        default=2,
+        choices=(1, 2, 3),
+        help="问题阶段：1=simple(单跳), 2=medium(双跳), 3=complex(三跳)",
+    )
+    parser.add_argument(
+        "--max-cnt",
+        type=int,
+        default=5,
+        help="生成问题数量（默认 5）",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="随机种子（默认 42，不同 stage 用不同 seed 可避免问题重叠）",
+    )
+    parser.add_argument(
+        "--output-prefix",
+        type=str,
+        default=None,
+        help="输出文件前缀（默认自动用 <stage>_stage）",
+    )
     args = parser.parse_args()
     data_name = args.data_name
+    question_stage = args.stage
+    max_cnt = args.max_cnt
 
-    # 当前脚本默认生成二阶段问题；如果要生成 1/3 阶段问题，可以改这里。
-    question_stage = 2
+    # 设置随机种子
+    np.random.seed(args.seed)
+
+    # 输出前缀
+    prefix_name = args.output_prefix or f"{question_stage}_stage"
 
     # Step_0 的输出会放在 caches/<data_name>/contexts/ 下。
     WORKING_DIR = Path("caches") / data_name
@@ -140,6 +174,7 @@ if __name__ == "__main__":
     # question_list 保存最终问题；reference_list 保存问题对应的参考原文，
     # 后续 scoring-based 评估可把 reference 当作参考答案材料。
     question_list, reference_list = [], []
+    source_context_indices = []  # 每个问题对应的 unique_contexts 起始下标
     with open(
         f"caches/{data_name}/contexts/{data_name}_unique_contexts.json",
         mode="r",
@@ -148,15 +183,12 @@ if __name__ == "__main__":
         # 读取 Step_0 抽出的去重 context 列表。
         unique_contexts = json.load(f)
 
-    # 这里只生成 5 个问题，适合快速复现实验流程。
-    # 如果要扩大评测集，可以调大 max_cnt。
-    cnt, max_cnt = 0, 5
-
     # 防止数据量太小时随机索引越界。
     max_idx = max(len(unique_contexts) - len_big_chunks - 1, 1)
 
+    cnt = 0
     with tqdm(
-        total=max_cnt, desc=f"Extracting {question_stage}-stage questions"
+        total=max_cnt, desc=f"Extracting {question_stage}-stage questions (seed={args.seed})"
     ) as pbar:
         while cnt < max_cnt:
             # 随机选择一个起点，取连续 context 拼成生成问题的 reference。
@@ -193,20 +225,45 @@ if __name__ == "__main__":
 
             question_list.append(question_text)
             reference_list.append(context)
+            source_context_indices.append(idx)
 
             cnt += 1
             pbar.update(1)
 
     # 保存问题和对应 reference：
-    # - questions/2_stage.json 是 Step_3 的输入；
-    # - questions/2_stage_ref.json 可供评估脚本使用。
-    prefix = f"caches/{data_name}/questions/{question_stage}_stage"
-    question_file_path = Path(f"{prefix}.json")
-    ref_file_path = Path(f"{prefix}_ref.json")
-    question_file_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(f"{prefix}.json", "w", encoding="utf-8") as f:
+    # - questions/<prefix>.json 是 Step_3 的输入；
+    # - questions/<prefix>_ref.json 可供评估脚本使用。
+    questions_dir = WORKING_DIR / "questions"
+    questions_dir.mkdir(parents=True, exist_ok=True)
+
+    question_file_path = questions_dir / f"{prefix_name}.json"
+    ref_file_path = questions_dir / f"{prefix_name}_ref.json"
+    meta_file_path = questions_dir / f"{prefix_name}_meta.json"
+
+    with open(question_file_path, "w", encoding="utf-8") as f:
         json.dump(question_list, f, ensure_ascii=False, indent=4)
-    with open(f"{prefix}_ref.json", "w", encoding="utf-8") as f:
+    with open(ref_file_path, "w", encoding="utf-8") as f:
         json.dump(reference_list, f, ensure_ascii=False, indent=4)
 
-    print(f"questions written to {question_file_path}")
+    # 写 meta 文件：每条记录包含 stage、expected_complexity、expected_strategy、ref_index、source_context_index
+    expected_complexity = STAGE_COMPLEXITY_MAP[question_stage]
+    expected_strategy = STAGE_STRATEGY_MAP[question_stage]
+    meta_list = [
+        {
+            "question_id": i,
+            "stage": question_stage,
+            "expected_complexity": expected_complexity,
+            "expected_strategy": expected_strategy,
+            "ref_index": i,
+            "source_context_index": source_context_indices[i],
+            "seed": args.seed,
+        }
+        for i in range(len(question_list))
+    ]
+    with open(meta_file_path, "w", encoding="utf-8") as f:
+        json.dump(meta_list, f, ensure_ascii=False, indent=4)
+
+    print(f"Questions written to {question_file_path}")
+    print(f"References written to {ref_file_path}")
+    print(f"Meta written to {meta_file_path}")
+    print(f"  stage={question_stage}, expected_complexity={expected_complexity}, count={len(question_list)}")

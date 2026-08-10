@@ -7,6 +7,7 @@
 """
 
 import asyncio
+import hashlib
 import html
 import os
 from dataclasses import dataclass
@@ -41,6 +42,16 @@ class JsonKVStorage(BaseKVStorage):
         return list(self._data.keys())
 
     async def index_done_callback(self):
+        write_json(self._data, self._file_name)
+
+    async def query_done_callback(self):
+        """Step 6: commit LLM response cache after each query.
+
+        Without this, keyword / Router / answer responses accumulated in
+        ``self._data`` only get written at process exit via ``index_done_callback``
+        (which is never called during a pure query run). This guarantees the
+        cache is persisted even if the process is interrupted.
+        """
         write_json(self._data, self._file_name)
 
     async def get_by_id(self, id):
@@ -141,6 +152,12 @@ class NanoVectorDBStorage(BaseVectorStorage):
         """查询文本先转 embedding，再按 cosine 相似度返回 top_k。"""
         embedding = await self.embedding_func([query])
         embedding = embedding[0]
+        # Step 6: persist the query embedding hash for reproducibility diagnosis.
+        # NOT cached — we intentionally re-embed every query to detect whether
+        # the embedding API itself is unstable across runs.
+        self._last_query_embedding_hash = hashlib.sha256(
+            np.asarray(embedding, dtype=np.float32).tobytes()
+        ).hexdigest()
         results = self._client.query(
             query=embedding,
             top_k=top_k,

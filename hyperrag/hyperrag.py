@@ -18,7 +18,7 @@ from typing import Type, cast
 
 from .chunking import chunking_by_token_size
 from .indexing import extract_entities
-from .query_modes import graph_query, hyper_query, hyper_query_lite, llm_query, naive_query
+from .query_modes import adaptive_query, graph_query, hyper_query, hyper_query_lite, llm_query, naive_query
 from .query_stream import (
     hyper_query_lite_stream,
     hyper_query_stream,
@@ -342,6 +342,16 @@ class HyperRAG:
                 param,
                 asdict(self),
             )
+        elif param.mode == "adaptive":
+            response = await adaptive_query(
+                query,
+                self.chunk_entity_relation_hypergraph,
+                self.entities_vdb,
+                self.relationships_vdb,
+                self.text_chunks,
+                param,
+                asdict(self),
+            )
         elif param.mode == "naive":
             response = await naive_query(
                 query,
@@ -373,7 +383,7 @@ class HyperRAG:
         cfg = asdict(self)
         cfg["llm_model_stream_func"] = self.llm_model_stream_func
 
-        if param.mode == "hyper":
+        if param.mode in {"hyper", "adaptive"}:
             async for tok in hyper_query_stream(
                     query,
                     self.chunk_entity_relation_hypergraph,

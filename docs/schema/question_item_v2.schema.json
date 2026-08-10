@@ -1,0 +1,149 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "question_item_v2.schema.json",
+  "title": "Question Item v2.1",
+  "description": "Single gold question item for the Hyper-RAG adaptive RAG benchmark. Derived from question_set_v2_frozen_design.md Section 5. Evidence-first construction: answer points must back-track to precise source evidence spans.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "question_id",
+    "language",
+    "question",
+    "gold_answer",
+    "answer_units",
+    "evidence_requirements",
+    "evidence_spans"
+  ],
+  "properties": {
+    "question_id": {
+      "type": "string",
+      "pattern": "^qv2-[A-Za-z0-9_-]+$",
+      "description": "Stable unique id, e.g. qv2-neuro-0001."
+    },
+    "language": {
+      "const": "en",
+      "description": "v2 main set is uniformly English (design doc 4.1)."
+    },
+    "question": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Constrained open-ended QA; no multiple choice, no broad review questions."
+    },
+    "gold_answer": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Concise gold answer in English."
+    },
+    "answer_units": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 5,
+      "description": "1..5 atomic answer points. Required units (required=true) must ALL be covered (AND across required units); optional units are best-effort.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["unit_id", "claim", "required"],
+        "properties": {
+          "unit_id": {
+            "type": "string",
+            "pattern": "^AU[0-9]+$"
+          },
+          "claim": {
+            "type": "string",
+            "minLength": 1
+          },
+          "required": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "evidence_requirements": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Intra-group OR, inter-group AND. Each group must be satisfied by at least one alternative chunk.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["requirement_id", "answer_unit_ids", "alternative_chunk_ids"],
+        "properties": {
+          "requirement_id": {
+            "type": "string",
+            "pattern": "^ER[0-9]+$"
+          },
+          "answer_unit_ids": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "pattern": "^AU[0-9]+$" }
+          },
+          "alternative_chunk_ids": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "evidence_spans": {
+      "type": "array",
+      "description": "Precise source evidence spans per answer unit. Each span is program-checkable by chunk_id + char offsets.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["unit_id", "evidence_spans"],
+        "properties": {
+          "unit_id": { "type": "string", "pattern": "^AU[0-9]+$" },
+          "evidence_spans": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["chunk_id", "start_char", "end_char", "quote"],
+              "properties": {
+                "chunk_id": { "type": "string", "minLength": 1 },
+                "start_char": { "type": "integer", "minimum": 0 },
+                "end_char": { "type": "integer", "minimum": 0 },
+                "quote": { "type": "string", "minLength": 1 }
+              }
+            }
+          }
+        }
+      }
+    },
+    "required_subgraph": {
+      "type": "object",
+      "description": "Reconstructable necessary evidence sub-hypergraph (design doc 5.4).",
+      "additionalProperties": false,
+      "properties": {
+        "required_vertices": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "required_hyperedges": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["hyperedge_id", "entity_set", "source_chunk_ids"],
+            "properties": {
+              "hyperedge_id": { "type": "string" },
+              "entity_set": { "type": "array", "items": { "type": "string" } },
+              "source_chunk_ids": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        },
+        "answer_unit_links": { "type": "object" },
+        "topology_metrics": { "type": "object" }
+      }
+    },
+    "intended_structure": {
+      "type": "string",
+      "description": "Structural label assigned at construction time (design doc 11). May be downgraded after shortcut audit."
+    },
+    "verified_structure": {
+      "type": "string",
+      "description": "Structural label confirmed only after shortcut audit passes."
+    }
+  }
+}

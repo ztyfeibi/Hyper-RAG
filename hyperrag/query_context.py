@@ -2,17 +2,30 @@
 
 import asyncio
 import re
+import time
 import warnings
 
 from .base import BaseHypergraphStorage, BaseKVStorage, BaseVectorStorage, QueryParam, TextChunkSchema
 from .prompt import GRAPH_FIELD_SEP
+from .type_aware_weighting import apply_type_aware_weighting
 from .utils import (
+    compute_mdhash_id,
     list_of_list_to_csv,
     logger,
     process_combine_contexts,
     split_string_by_multi_markers,
     truncate_list_by_token_size,
 )
+
+
+def _stable_edge_id(id_set) -> str:
+    """Stable string key for a hyperedge's entity-set.
+
+    Python ``set`` iteration order depends on ``PYTHONHASHSEED``; sorting the
+    elements first gives a canonical key so that two hyperedges over the same
+    entity set always compare equal and sort deterministically.
+    """
+    return "|".join(sorted(str(x) for x in id_set))
 
 
 async def _build_entity_query_context(
@@ -27,9 +40,36 @@ async def _build_entity_query_context(
     输入 query 是低阶关键词字符串。
     输出是包含 context、entities、hyperedges、text_units 的结构化上下文包。
     """
-    results = await entities_vdb.query(query, top_k=query_param.top_k)
+    # Step 1.3: split top-k (entity_vdb_top_k -> fallback legacy top_k);
+    # 0 means "skip the entity VDB entirely" for fixed routes.
+    entity_top_k = query_param.effective_entity_top_k()
+    if entity_top_k <= 0:
+        return None
+    # 真实检索耗时 + 真实 cosine 分数（绝不补零）
+    _t0 = time.perf_counter()
+    results = await entities_vdb.query(query, top_k=entity_top_k)
+    retrieval_latency_ms = (time.perf_counter() - _t0) * 1000.0
     if not len(results):
         return None
+
+    # Step 6: capture query embedding hash (diagnose embedding API stability)
+    entity_query_embedding_hash = getattr(
+        entities_vdb, "_last_query_embedding_hash", None
+    )
+
+    # Step 5.4: capture raw VDB IDs + 真实 cosine 分数（distance）before any processing
+    entity_vdb_ids = [r["entity_name"] for r in results]
+    entity_vdb_scores = [float(r.get("distance", 0.0)) for r in results]
+    embedding_calls = 1  # 本次 VDB query 内部做了 1 次 query embedding
+
+    # Step 4: type-aware soft boost + re-sort (no-op when disabled)
+    results = apply_type_aware_weighting(
+        results,
+        focus_types=query_param.route_focus_types,
+        result_kind="entity",
+        enabled=query_param.enable_type_aware_weighting,
+    )
+
     node_datas = await asyncio.gather(
         *[knowledge_hypergraph_inst.get_vertex(r["entity_name"]) for r in results]
     )
@@ -46,19 +86,39 @@ async def _build_entity_query_context(
         if n is not None
     ]
 
-    use_text_units = await _find_most_related_text_unit_from_entities(
-        node_datas, query_param, text_chunks_db, knowledge_hypergraph_inst
+    # 拆分 seed 与 context 两套实体：
+    # seed_node_datas 保留全部召回实体，用于超图扩散找 text_units 和 relations
+    # context_node_datas 按 max_token_for_entity_context 截断，仅用于写入 prompt 的 Entity CSV
+    seed_node_datas = node_datas
+    # 问题 3：每个 VDB 候选的 source provenance —— 该实体是从哪些原文 chunk 抽出来的。
+    # 与 entity_vdb_ids 严格对齐；图里查不到的候选记 None（不伪造空列表）。
+    _ent_src_map = {
+        n["entity_name"]: split_string_by_multi_markers(
+            n.get("source_id", "") or "", [GRAPH_FIELD_SEP])
+        for n in node_datas
+    }
+    entity_vdb_source_ids = [_ent_src_map.get(eid) for eid in entity_vdb_ids]
+    context_node_datas = truncate_list_by_token_size(
+        node_datas,
+        key=lambda x: x.get("description", ""),
+        max_token_size=query_param.tiktoken_entity_cap(),
     )
 
-    use_relations = await _find_most_related_edges_from_entities(
-        node_datas, query_param, knowledge_hypergraph_inst
+    use_text_units, tu_reads = await _find_most_related_text_unit_from_entities(
+        seed_node_datas, query_param, text_chunks_db, knowledge_hypergraph_inst
+    )
+
+    use_relations, er_reads = await _find_most_related_edges_from_entities(
+        seed_node_datas, query_param, knowledge_hypergraph_inst
     )
 
     logger.info(
-        f"entity query uses {len(node_datas)} entites, {len(use_relations)} relations, {len(use_text_units)} text units"
+        f"entity query uses {len(seed_node_datas)} seed entities, "
+        f"{len(context_node_datas)} context entities, "
+        f"{len(use_relations)} relations, {len(use_text_units)} text units"
     )
     entities_section_list = [["id", "entity", "type", "description", "additional properties", "rank"]]
-    for i, n in enumerate(node_datas):
+    for i, n in enumerate(context_node_datas):
         entities_section_list.append(
             [
                 i,
@@ -122,7 +182,7 @@ async def _build_entity_query_context(
                 "additional_properties": n.get("additional_properties", "UNKNOWN"),
                 "rank": n["rank"]
             }
-            for i, n in enumerate(node_datas)
+            for i, n in enumerate(context_node_datas)
         ],
         "hyperedges": [
             {
@@ -142,7 +202,25 @@ async def _build_entity_query_context(
                 "content": t["content"]
             }
             for i, t in enumerate(use_text_units)
-        ]
+        ],
+        # Step 5.4/6: trace fields for reproducibility diagnostics
+        "entity_vdb_ids": entity_vdb_ids,
+        "entity_vdb_scores": entity_vdb_scores,
+        "entity_vdb_source_ids": entity_vdb_source_ids,
+        "entity_query_embedding_hash": entity_query_embedding_hash,
+        "entity_post_graph_ids": [n["entity_name"] for n in seed_node_datas],
+        "entity_post_truncate_ids": [n["entity_name"] for n in context_node_datas],
+        "entity_line_relation_ids": [
+            _stable_edge_id(e["src_tgt"]) for e in use_relations
+        ],
+        "text_unit_ids": [
+            compute_mdhash_id(t["content"], prefix="chunk-") for t in use_text_units
+        ],
+        # Step 1 收尾：真实检索成本计数（绝不补零）
+        "embedding_calls": embedding_calls,
+        "graph_expansion_calls": tu_reads + er_reads,
+        "retrieval_latency_ms": retrieval_latency_ms,
+        "retrieved_candidate_count": len(results),
     }
 
 async def _find_most_related_text_unit_from_entities(
@@ -160,6 +238,7 @@ async def _find_most_related_text_unit_from_entities(
     edges = await asyncio.gather(
         *[knowledge_hypergraph_inst.get_nbr_e_of_vertex(dp['entity_name']) for dp in node_datas]
     )
+    graph_reads = len(node_datas)  # get_nbr_e_of_vertex x N
 
     all_one_hop_nodes = set()
     for this_edges in edges:
@@ -168,10 +247,12 @@ async def _find_most_related_text_unit_from_entities(
         for edge_tuple in this_edges:
             all_one_hop_nodes.update(edge_tuple)
 
-    all_one_hop_nodes = list(all_one_hop_nodes)
+    # Step 6: sort the set so downstream order is independent of PYTHONHASHSEED
+    all_one_hop_nodes = sorted(all_one_hop_nodes)
     all_one_hop_nodes_data = await asyncio.gather(
         *[knowledge_hypergraph_inst.get_vertex(e) for e in all_one_hop_nodes]
     )
+    graph_reads += len(all_one_hop_nodes)  # get_vertex x M
     
     # Add null check for node data
     all_one_hop_text_units_lookup = {
@@ -216,17 +297,17 @@ async def _find_most_related_text_unit_from_entities(
 
     all_text_units = sorted(
         all_text_units, 
-        key=lambda x: (x["order"], -x["relation_counts"])
+        key=lambda x: (x["order"], -x["relation_counts"], x["id"])
     )
 
     all_text_units = truncate_list_by_token_size(
         all_text_units,
         key=lambda x: x["data"]["content"],
-        max_token_size=query_param.max_token_for_text_unit,
+        max_token_size=query_param.tiktoken_source_cap(),
     )
 
     all_text_units = [t["data"] for t in all_text_units]
-    return all_text_units
+    return all_text_units, graph_reads
 
 async def _find_most_related_edges_from_entities(
     node_datas: list[dict],
@@ -237,18 +318,22 @@ async def _find_most_related_edges_from_entities(
     all_related_edges = await asyncio.gather(
         *[knowledge_hypergraph_inst.get_nbr_e_of_vertex(dp['entity_name']) for dp in node_datas]
     )
+    graph_reads = len(node_datas)  # get_nbr_e_of_vertex x N
 
     all_edges = set()
     for this_edges in all_related_edges:
         all_edges.update([tuple(sorted(e)) for e in this_edges])
-    all_edges = list(all_edges)
+    # Step 6: sort the set so downstream order is independent of PYTHONHASHSEED
+    all_edges = sorted(all_edges)
     all_edges_pack = await asyncio.gather(
         *[knowledge_hypergraph_inst.get_hyperedge(e) for e in all_edges]
     )
+    graph_reads += len(all_edges)  # get_hyperedge x E
 
     all_edges_degree = await asyncio.gather(
         *[knowledge_hypergraph_inst.hyperedge_degree(e) for e in all_edges]
     )
+    graph_reads += len(all_edges)  # hyperedge_degree x E
     all_edges_data = [
         {"src_tgt": k, "rank": d, **v}
         for k, v, d in zip(all_edges, all_edges_pack, all_edges_degree)
@@ -256,14 +341,17 @@ async def _find_most_related_edges_from_entities(
     ]
 
     all_edges_data = sorted(
-        all_edges_data, key=lambda x: (x["rank"], x["weight"]), reverse=True
+        all_edges_data,
+        key=lambda x: (-x["rank"], -x["weight"], _stable_edge_id(x["src_tgt"])),
     )
+    # P2 语义：即使 relation_vdb_top_k=0（不查 Relation VDB），实体邻接扩展
+    # 产生的 Relationships 仍受 relation_description_cap 约束。
     all_edges_data = truncate_list_by_token_size(
         all_edges_data,
         key=lambda x: x["description"],
-        max_token_size=query_param.max_token_for_relation_context,
+        max_token_size=query_param.tiktoken_relation_cap(),
     )
-    return all_edges_data
+    return all_edges_data, graph_reads
 
 async def _build_relation_query_context(
     keywords,
@@ -278,10 +366,37 @@ async def _build_relation_query_context(
     输入 keywords 是高阶关键词字符串。
     输出同样是包含 context、entities、hyperedges、text_units 的结构化上下文包。
     """
-    results = await relationships_vdb.query(keywords, top_k=query_param.top_k)
+    # Step 1.3: split top-k. relation_vdb_top_k=0 (e.g. fixed route P2) means
+    # the Relation VDB line is skipped entirely -- Relationships in the final
+    # context then come only from entity adjacency expansion.
+    relation_top_k = query_param.effective_relation_top_k()
+    if relation_top_k <= 0:
+        return None
+    # 真实检索耗时 + 真实 cosine 分数（绝不补零）
+    _t0 = time.perf_counter()
+    results = await relationships_vdb.query(keywords, top_k=relation_top_k)
+    retrieval_latency_ms = (time.perf_counter() - _t0) * 1000.0
 
     if not len(results):
         return None
+
+    # Step 6: capture query embedding hash (diagnose embedding API stability)
+    relation_query_embedding_hash = getattr(
+        relationships_vdb, "_last_query_embedding_hash", None
+    )
+
+    # Step 5.4: capture raw VDB IDs + 真实 cosine 分数（distance）before any processing
+    relation_vdb_ids = [str(r["id_set"]) for r in results]
+    relation_vdb_scores = [float(r.get("distance", 0.0)) for r in results]
+    embedding_calls = 1  # 本次 VDB query 内部做了 1 次 query embedding
+
+    # Step 4: type-aware soft boost + re-sort (no-op when disabled)
+    results = apply_type_aware_weighting(
+        results,
+        focus_types=query_param.route_focus_types,
+        result_kind="relation",
+        enabled=query_param.enable_type_aware_weighting,
+    )
 
     edge_datas = await asyncio.gather(
         *[knowledge_hypergraph_inst.get_hyperedge(r['id_set']) for r in results]
@@ -294,23 +409,36 @@ async def _build_relation_query_context(
     )
 
     edge_datas = [
-        {"id_set": k["id_set"], "rank": d, **v}
+        {"id_set": k["id_set"], **v, "weight": k.get("weight", v.get("weight", 1.0)), "rank": d}
         for k, v, d in zip(results, edge_datas, edge_degree)
         if v is not None
     ]
+
+    # Step 5.4: capture IDs after graph lookup + filtering, before sort/truncation
+    relation_post_filter_ids = [str(e["id_set"]) for e in edge_datas]
+    # 问题 3：每个关系候选的 source provenance（超边来自哪些原文 chunk）。
+    # 与 relation_vdb_ids（str(id_set)）严格对齐；图里查不到的候选记 None。
+    _rel_src_map = {
+        str(e["id_set"]): split_string_by_multi_markers(
+            e.get("source_id", "") or "", [GRAPH_FIELD_SEP])
+        for e in edge_datas
+    }
+    relation_vdb_source_ids = [_rel_src_map.get(rid) for rid in relation_vdb_ids]
+
     edge_datas = sorted(
-        edge_datas, key=lambda x: (x["rank"], x["weight"]), reverse=True
+        edge_datas,
+        key=lambda x: (-x["rank"], -x["weight"], _stable_edge_id(x["id_set"])),
     )
     edge_datas = truncate_list_by_token_size(
         edge_datas,
         key=lambda x: x["description"],
-        max_token_size=query_param.max_token_for_relation_context,
+        max_token_size=query_param.tiktoken_relation_cap(),
     )
 
-    use_entities = await _find_most_related_entities_from_relationships(
+    use_entities, ue_reads = await _find_most_related_entities_from_relationships(
         edge_datas, query_param, knowledge_hypergraph_inst
     )
-    use_text_units = await _find_related_text_unit_from_relationships(
+    use_text_units, ut_reads = await _find_related_text_unit_from_relationships(
         edge_datas, query_param, text_chunks_db, knowledge_hypergraph_inst
     )
     logger.info(
@@ -399,7 +527,23 @@ async def _build_relation_query_context(
                 "content": t["content"]
             }
             for i, t in enumerate(use_text_units)
-        ]
+        ],
+        # Step 5.4/6: trace fields for reproducibility diagnostics
+        "relation_vdb_ids": relation_vdb_ids,
+        "relation_vdb_scores": relation_vdb_scores,
+        "relation_vdb_source_ids": relation_vdb_source_ids,
+        "relation_query_embedding_hash": relation_query_embedding_hash,
+        "relation_post_filter_ids": relation_post_filter_ids,
+        "relation_post_truncate_ids": [str(e["id_set"]) for e in edge_datas],
+        "relation_line_entity_ids": [n["entity_name"] for n in use_entities],
+        "text_unit_ids": [
+            compute_mdhash_id(t["content"], prefix="chunk-") for t in use_text_units
+        ],
+        # Step 1 收尾：真实检索成本计数（绝不补零）
+        "embedding_calls": embedding_calls,
+        "graph_expansion_calls": ue_reads + ut_reads,
+        "retrieval_latency_ms": retrieval_latency_ms,
+        "retrieved_candidate_count": len(results),
     }
 
 async def _find_most_related_entities_from_relationships(
@@ -414,26 +558,33 @@ async def _find_most_related_entities_from_relationships(
             if await knowledge_hypergraph_inst.has_vertex(f):
                 entity_names.add(f)
 
+    # Step 6: sort the set so downstream order is independent of PYTHONHASHSEED
+    entity_names = sorted(entity_names)
+
     node_datas = await asyncio.gather(
         *[knowledge_hypergraph_inst.get_vertex(entity_name) for entity_name in entity_names]
     )
+    graph_reads = len(entity_names)  # get_vertex x |entities|
 
     node_degrees = await asyncio.gather(
         *[knowledge_hypergraph_inst.vertex_degree(entity_name) for entity_name in entity_names]
     )
+    graph_reads += len(entity_names)  # vertex_degree x |entities|
 
     node_datas = [
         {**n, "entity_name": k, "rank": d}
         for k, n, d in zip(entity_names, node_datas, node_degrees)
     ]
 
+    # Step 6: stable tie-break before truncation (deterministic ranking)
+    node_datas = sorted(node_datas, key=lambda x: (-x["rank"], x["entity_name"]))
     node_datas = truncate_list_by_token_size(
         node_datas,
         key=lambda x: x["description"],
-        max_token_size=query_param.max_token_for_entity_context,
+        max_token_size=query_param.tiktoken_entity_cap(),
     )
 
-    return node_datas
+    return node_datas, graph_reads
 
 async def _find_related_text_unit_from_relationships(
     edge_datas: list[dict],
@@ -466,11 +617,12 @@ async def _find_related_text_unit_from_relationships(
     all_text_units = truncate_list_by_token_size(
         all_text_units,
         key=lambda x: x["data"]["content"],
-        max_token_size=query_param.max_token_for_text_unit,
+        max_token_size=query_param.tiktoken_source_cap(),
     )
     all_text_units: list[TextChunkSchema] = [t["data"] for t in all_text_units]
 
-    return all_text_units
+    # 本函数只读取 text_chunks KV，不扩展超图，故 graph_expansion_calls=0。
+    return all_text_units, 0
 
 def combine_contexts(relation_context, entity_context):
     """合并关系线和实体线的 CSV 上下文。"""
