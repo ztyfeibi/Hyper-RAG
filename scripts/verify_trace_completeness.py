@@ -43,21 +43,46 @@ TOKEN_TOLERANCE = 0
 
 def _load_route(base: Path, route: str, snapshot: str, repeat: int, seed: int,
                 contract_tag: str):
+    """加载一条路径的全部 result / trace 记录（JSONL 逐行 or 旧 JSON 数组）。
+
+    Returns
+    -------
+    (results, traces, err) —— 均为**全量**列表（不取第一条）；result 与 trace
+    行数必须一一对应，这是本脚本检查的一部分，由调用方比对。
+    """
     stem = f"fixed_{route}_r{repeat}_s{seed}_{contract_tag}_{snapshot}"
-    res_path = base / f"{stem}_result.json"
+    # 优先查找 JSONL 格式（新），回退到 JSON 数组（旧）
+    res_path_jsonl = base / f"{stem}_result.jsonl"
+    res_path_json = base / f"{stem}_result.json"
     trace_path = base / f"{stem}_trace.jsonl"
-    if not res_path.exists():
-        return None, None, f"缺少结果文件 {res_path.name}"
-    res = json.loads(res_path.read_text(encoding="utf-8"))
-    res = res[0] if isinstance(res, list) and res else res
-    trace = None
+
+    results = []
+    if res_path_jsonl.exists():
+        # JSONL: 逐行读取全部有效记录
+        for line in res_path_jsonl.read_text(encoding="utf-8").strip().splitlines():
+            line = line.strip()
+            if line:
+                results.append(json.loads(line))
+        if not results:
+            return [], [], f"结果文件为空 {res_path_jsonl.name}"
+    elif res_path_json.exists():
+        # 旧格式: JSON 数组
+        data = json.loads(res_path_json.read_text(encoding="utf-8"))
+        results = data if isinstance(data, list) else [data]
+        if not results:
+            return [], [], f"结果文件为空 {res_path_json.name}"
+    else:
+        return [], [], f"缺少结果文件 {stem}_result.jsonl/.json"
+
+    traces = []
     if trace_path.exists():
-        lines = trace_path.read_text(encoding="utf-8").strip().splitlines()
-        if lines:
-            trace = json.loads(lines[0])
-    if trace is None:
-        return res, None, f"缺少 trace {trace_path.name}"
-    return res, trace, None
+        for line in trace_path.read_text(encoding="utf-8").strip().splitlines():
+            line = line.strip()
+            if line:
+                traces.append(json.loads(line))
+    if not traces:
+        return results, [], f"缺少 trace {trace_path.name}"
+    return results, traces, None
 
 
 def _check_provenance(trace: dict) -> list:
@@ -76,6 +101,49 @@ def _check_provenance(trace: dict) -> list:
                 f"retriever={r.get('retriever_id')} 全部 {missing} 个候选 "
                 f"source_provenance_ids 为 null")
     return problems
+
+
+def _check_route_identity(results: list, traces: list) -> list:
+    """result 与 trace 的 question_id 必须**完全一致**（含顺序）且无重复。
+
+    result 是唯一事实源，trace 是其派生副本：任何错位/缺失/重复都说明
+    两文件未对齐，产物不可引用。
+    """
+    problems = []
+    res_ids, trc_ids = [], []
+    for i, r in enumerate(results):
+        qid = r.get("question_id")
+        if qid is None:
+            problems.append(f"result[{i}] 缺 question_id")
+        else:
+            res_ids.append(str(qid))
+    for i, t in enumerate(traces):
+        qid = t.get("question_id")
+        if qid is None:
+            problems.append(f"trace[{i}] 缺 question_id")
+        else:
+            trc_ids.append(str(qid))
+    if res_ids and res_ids != trc_ids:
+        problems.append(
+            f"result/trace question_id 不一致: result={res_ids} trace={trc_ids}")
+    if len(res_ids) != len(set(res_ids)):
+        dup = sorted({x for x in res_ids if res_ids.count(x) > 1})
+        problems.append(f"result 存在重复 question_id: {dup}")
+    return problems
+
+
+def _check_manifest(base: Path, stem: str, route: str) -> list:
+    """manifest 必须存在且 status == complete（incomplete 批次不得验收）。"""
+    mpath = base / f"{stem}_manifest.json"
+    if not mpath.exists():
+        return [f"{route}:manifest 缺失（无法确认批次状态）"]
+    try:
+        m = json.loads(mpath.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        return [f"{route}:manifest 无法解析: {e}"]
+    if m.get("status") != "complete":
+        return [f"{route}:manifest.status={m.get('status')} != complete"]
+    return []
 
 
 def _check_stages(trace: dict) -> list:
@@ -100,6 +168,9 @@ def main() -> int:
     ap.add_argument("--contract-tag", default="v2.1-v1",
                     help="产物文件名中的契约标记段")
     ap.add_argument("--contract", default=None)
+    ap.add_argument("--expected-count", type=int, default=None,
+                    help="每条路径的预期记录数（正式全量=80；smoke 传 3）。"
+                         "缺省不检查条数。")
     args = ap.parse_args()
 
     repo = Path(__file__).resolve().parent.parent
@@ -139,55 +210,88 @@ def main() -> int:
     print(f"    -> {'一致' if snap_ok else '不一致（产物与当前源码不匹配）'}")
     print()
 
-    # --- 检查 2-5：逐路径 ---
-    header = (f"{'route':8} {'ctx_qwen':>9} {'reported':>9} {'hard_cap':>9} "
-              f"{'finish':>8} {'prov':>5} {'stages':>7}  结论")
-    print("[2-5] 逐路径 Trace 完整性")
+    # --- 检查 2-5：逐路径、逐条记录 ---
+    header = (f"{'#':>3} {'qid':>12} {'ctx_qwen':>9} {'reported':>9} "
+              f"{'hard_cap':>9} {'finish':>8} {'prov':>5} {'stages':>7}  结论")
+    print("[2-5] 逐路径 Trace 完整性（全部记录逐条检查）")
     print("    " + header)
     for route in args.routes:
-        res, trace, err = _load_route(
+        results, traces, err = _load_route(
             base, route, args.snapshot, args.repeat, args.seed, args.contract_tag)
         if err:
             print(f"    {route:8} {err}")
             failures.append(f"{route}:{err}")
             continue
 
-        problems = []
-        ctx = res.get("context") or ""
-        real = counter(ctx)
-        reported = (trace.get("stages") or {}).get("tokens_after_truncation")
-        if reported is None:
-            problems.append("tokens_after_truncation 缺失")
-        elif abs(real - reported) > TOKEN_TOLERANCE:
-            problems.append(f"上报 token {reported} != 真实 {real}")
+        # 0) 行数一致性：result 与 trace 必须一一对应
+        if len(results) != len(traces):
+            msg = (f"result {len(results)} 行 != trace {len(traces)} 行"
+                   f"（应一一对应）")
+            print(f"    {route:8} {msg}")
+            failures.append(f"{route}:{msg}")
+            continue
 
-        cap = None
-        if route != GOLD_ROUTE_ID:
-            cap = contract.route(route).final_context_hard_cap
-            if cap and real > cap:
-                problems.append(f"超硬上限 {real} > {cap}")
+        # 0.1) ID 一致性：result/trace 的 question_id 完全相等（含顺序）、无重复
+        id_problems = _check_route_identity(results, traces)
+        # 0.2) 预期条数：正式全量必须为 80 条（--expected-count 指定时）
+        if args.expected_count is not None and len(results) != args.expected_count:
+            id_problems.append(
+                f"记录数 {len(results)} != 预期 {args.expected_count}")
+        # 0.3) manifest 状态：status 必须为 complete
+        stem = f"fixed_{route}_r{args.repeat}_s{args.seed}_{args.contract_tag}_{args.snapshot}"
+        id_problems.extend(_check_manifest(base, stem, route))
+        if id_problems:
+            for p in id_problems:
+                print(f"    {route:8} {p}")
+                failures.append(f"{route}:{p}")
+            continue
 
-        finish = trace.get("finish_reason")
-        if finish is None:
-            problems.append("finish_reason 为 null")
+        route_fail = 0
+        for idx, (res, trace) in enumerate(zip(results, traces)):
+            problems = []
+            ctx = res.get("context") or ""
+            real = counter(ctx)
+            reported = (trace.get("stages") or {}).get("tokens_after_truncation")
+            if reported is None:
+                problems.append("tokens_after_truncation 缺失")
+            elif abs(real - reported) > TOKEN_TOLERANCE:
+                problems.append(f"上报 token {reported} != 真实 {real}")
 
-        # 实验输入锁定：每条运行记录必须带问题集哈希；P_gold 还必须带 gold 哈希
-        if res.get("question_file_hash") is None:
-            problems.append("question_file_hash 缺失（实验输入未锁定）")
-        if route == GOLD_ROUTE_ID and res.get("gold_context_file_hash") is None:
-            problems.append("gold_context_file_hash 缺失（P_gold 输入未锁定）")
+            cap = None
+            if route != GOLD_ROUTE_ID:
+                cap = contract.route(route).final_context_hard_cap
+                if cap and real > cap:
+                    problems.append(f"超硬上限 {real} > {cap}")
 
-        prov_problems = _check_provenance(trace)
-        problems.extend(prov_problems)
-        stage_problems = _check_stages(trace)
-        problems.extend(stage_problems)
+            finish = trace.get("finish_reason")
+            if finish is None:
+                problems.append("finish_reason 为 null")
 
-        print(f"    {route:8} {real:>9} {str(reported):>9} {str(cap):>9} "
-              f"{str(finish):>8} {'OK' if not prov_problems else 'NG':>5} "
-              f"{'OK' if not stage_problems else 'NG':>7}  "
-              f"{'PASS' if not problems else 'FAIL: ' + '; '.join(problems)}")
-        if problems:
-            failures.append(f"{route}: {'; '.join(problems)}")
+            # 实验输入锁定：每条运行记录必须带问题集哈希；P_gold 还必须带 gold 哈希
+            if res.get("question_file_hash") is None:
+                problems.append("question_file_hash 缺失（实验输入未锁定）")
+            if route == GOLD_ROUTE_ID and res.get("gold_context_file_hash") is None:
+                problems.append("gold_context_file_hash 缺失（P_gold 输入未锁定）")
+
+            prov_problems = _check_provenance(trace)
+            problems.extend(prov_problems)
+            stage_problems = _check_stages(trace)
+            problems.extend(stage_problems)
+
+            qid = res.get("question_id") or trace.get("question_id") or "?"
+            verdict = "PASS" if not problems else "FAIL: " + "; ".join(problems)
+            print(f"    {idx:>3} {str(qid):>12} {real:>9} {str(reported):>9} "
+                  f"{str(cap):>9} {str(finish):>8} "
+                  f"{'OK' if not prov_problems else 'NG':>5} "
+                  f"{'OK' if not stage_problems else 'NG':>7}  {verdict}")
+            if problems:
+                route_fail += 1
+                failures.append(f"{route}[{qid}]: {'; '.join(problems)}")
+
+        print(f"    {route:8} 汇总: {len(results)} 条记录，"
+              f"{'全部通过' if route_fail == 0 else f'{route_fail} 条失败'}")
+        if route_fail == 0:
+            print()
 
     print()
     if failures:

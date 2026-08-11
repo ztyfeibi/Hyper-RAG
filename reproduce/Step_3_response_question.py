@@ -69,6 +69,218 @@ def extract_queries(file_path):
     return query_list
 
 
+def extract_queries_v2(file_path):
+    """读取最终锁定题集（JSONL 或 JSON 数组），返回 (queries, question_ids)。
+
+    - ``.jsonl``：逐行解析，每行是一个完整 question 对象（含 question_id、question 等）。
+    - ``.json``  ：JSON 数组；元素为 dict 时取 question_id / question，
+                   元素为 str 时退化为旧格式（question_id 用整数索引）。
+
+    Returns
+    -------
+    queries : list[str]  — 每题的问题文本
+    question_ids : list[str] — 每题的真实 question_id（旧格式退化为 str(index)）
+    """
+    p = Path(file_path)
+    queries: list[str] = []
+    question_ids: list[str] = []
+    if p.suffix == ".jsonl":
+        with open(p, "r", encoding="utf-8") as f:
+            for idx, line in enumerate(f):
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                qid = obj.get("question_id") or str(idx)
+                q = obj.get("question") or ""
+                if not q:
+                    raise ValueError(f"question_id={qid} (line {idx}) has empty question text")
+                queries.append(q)
+                question_ids.append(str(qid))
+    else:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for idx, item in enumerate(data):
+            if isinstance(item, dict):
+                qid = item.get("question_id") or str(idx)
+                q = item.get("question") or ""
+                if not q:
+                    raise ValueError(f"question_id={qid} (index {idx}) has empty question text")
+            else:
+                qid = str(idx)
+                q = str(item)
+            queries.append(q)
+            question_ids.append(qid)
+    return queries, question_ids
+
+
+def _write_run_manifest(manifest_path: str, data: dict):
+    """写出每路径的实验 manifest（题集哈希、代码指纹、参数、计数、时间）。"""
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# 断点续跑 / 运行身份 / 产物一致性（Step 1.5 实验运行基础设施）
+#
+# 断点续跑必须按 **run_identity**（六要素）判定，而非只看 question_id：
+# 同一 qid 但换 snapshot / seed / 题集 / 契约时，旧记录是其它实验的产物，
+# 不得复用，必须清理后重跑；同 qid 且六要素全一致，才是真正的中断续跑。
+#
+# result.jsonl 每行内嵌完整 trace 记录（"trace" 字段），它是唯一事实源；
+# trace.jsonl 仅为冗余派生副本，任何时刻可由 result 重建（_rebuild_*）。
+# 因此写入顺序固定为"先 result 后 trace"：若进程在两者之间崩溃，resume
+# 阶段以 result 为准重建 trace 行，绝不产生"有 trace 无 result"的悬空记录。
+# ---------------------------------------------------------------------------
+
+def _run_identity(route_id, repeat_id, seed, contract_version,
+                  system_snapshot_id, question_file_hash):
+    """当前运行的身份元组：六要素完全一致才算同一批实验的断点续跑。"""
+    return (
+        route_id, repeat_id, seed, contract_version,
+        system_snapshot_id, question_file_hash,
+    )
+
+
+def _record_identity(rec: dict):
+    """从一条 result 记录提取身份元组；字段不全（无法判定）返回 None。"""
+    keys = ("route_id", "repeat_id", "seed", "contract_version",
+            "system_snapshot_id", "question_file_hash")
+    try:
+        vals = tuple(rec.get(k) for k in keys)
+    except AttributeError:
+        return None
+    if any(v is None for v in vals):
+        return None
+    return vals
+
+
+def _load_result_records(jsonl_path: str) -> list:
+    """读取 result JSONL 全部有效记录（损坏行跳过），保持文件内顺序。"""
+    records = []
+    p = Path(jsonl_path)
+    if not p.exists():
+        return records
+    with open(p, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return records
+
+
+def _classify_existing_records(records: list, identity):
+    """把已有 result 记录分成两批：
+
+    - processed：身份与当前 run 完全一致 -> 断点续跑时跳过（不重跑）；
+    - stale：身份不一致（或字段不全无法判定）-> 属其它实验产物，须清理重跑。
+    """
+    processed, stale = set(), set()
+    for rec in records:
+        qid = rec.get("question_id")
+        if qid is None:
+            continue  # 无 qid 的行无法归属，交由 _rewrite_jsonl_keep 剔除
+        if _record_identity(rec) == identity:
+            processed.add(str(qid))
+        else:
+            stale.add(str(qid))
+    return processed, stale
+
+
+def _rewrite_jsonl_keep(jsonl_path: str, keep_qids: set):
+    """重写 JSONL，仅保留 question_id 在 keep_qids 中的行（文件不存在则无操作）。
+
+    用于清理异身份旧记录：result / trace / errors 三个文件都按 qid 对齐。
+    """
+    p = Path(jsonl_path)
+    if not p.exists():
+        return
+    with open(p, "r", encoding="utf-8") as f:
+        lines = [ln for ln in f if ln.strip()]
+    kept = []
+    for ln in lines:
+        try:
+            rec = json.loads(ln)
+            qid = rec.get("question_id")
+        except json.JSONDecodeError:
+            continue
+        if qid is not None and str(qid) in keep_qids:
+            kept.append(ln)
+    with open(p, "w", encoding="utf-8") as f:
+        f.writelines(kept)
+
+
+def _rebuild_trace_from_results(result_file: str, trace_file: str):
+    """让 trace.jsonl 与 result.jsonl 完全对齐（result 内嵌 trace 为唯一事实源）。
+
+    - **始终** 以 result 行内嵌的 "trace" 字段重建每一行；已有 trace 文件
+      的内容一律忽略——它是纯派生副本，任何时刻都可由 result 完整重建，
+      不得存在"以旧 trace 优先"的语义。
+    - result 中缺失内嵌 trace 的记录不产出 trace 行（事实源缺失必须暴露，
+      由调用方校验两文件行数是否对齐）。
+    - trace_file 不存在时由 result 全量派生。
+    """
+    if not trace_file:
+        return
+    records = _load_result_records(result_file)
+    lines = []
+    for rec in records:
+        qid = rec.get("question_id")
+        if qid is None:
+            continue
+        tr = rec.get("trace")
+        if isinstance(tr, dict) and tr:
+            lines.append(json.dumps(tr, ensure_ascii=False) + "\n")
+    with open(trace_file, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+
+
+def _write_record_pair(rf, tf, out: dict, record: dict):
+    """成对写入 result + trace（先 result 后 trace，返回前双 flush）。
+
+    result 行内嵌完整 trace（事实源）；trace.jsonl 为冗余副本，任何时刻
+    可由 result 重建。若进程在两次写入之间崩溃，resume 阶段以 result 为准
+    重建 trace 行，保证两文件永远一一对应。
+    """
+    rf.write(json.dumps(out, ensure_ascii=False) + "\n")
+    rf.flush()
+    if record is not None and tf is not None:
+        tf.write(json.dumps(record, ensure_ascii=False) + "\n")
+        tf.flush()
+
+
+def _compute_run_status(cumulative_processed: int, requested_count: int,
+                        error_count: int) -> str:
+    """实验批次状态：累计成功数覆盖本次配置题数且无错误 -> complete。
+
+    - 被 --max-questions 截断的 smoke 批次：requested_count 是截断后的题数，
+      状态可为 complete，但 manifest.truncated=True 明确标记不可当全量。
+    - 全量批次中途失败：error_count>0 或累计数不足 -> incomplete。
+    """
+    if cumulative_processed >= requested_count and error_count == 0:
+        return "complete"
+    return "incomplete"
+
+
+def _check_locked_question_hash(expected_sha256: str, actual_sha256: str) -> bool:
+    """题集 SHA-256 锁定校验（fail-fast 的前置判定）。
+
+    一致返回 True（并打印锁定确认）；不一致打印 FATAL 并返回 False，
+    由调用方立即 sys.exit(2)——必须在任何 stale 清理/续跑逻辑之前调用。
+    """
+    if expected_sha256 == actual_sha256:
+        print(f"[locked] question file SHA-256 verified: {actual_sha256}")
+        return True
+    print(f"FATAL: question file SHA-256 mismatch — "
+          f"expected {expected_sha256}, actual {actual_sha256}")
+    print("       拒绝运行：题集内容与锁定哈希不符，不产出也不清理任何实验产物。")
+    return False
+
+
 async def process_query(query_text, rag_instance, query_param):
     """对单个问题调用 HyperRAG.aquery，并把成功/失败结果拆开返回。
 
@@ -286,6 +498,14 @@ if __name__ == "__main__":
              "默认根据 --question-stage 自动生成",
     )
     parser.add_argument(
+        "--question-file-path",
+        type=str,
+        default=None,
+        help="直接指定问题文件完整路径（支持 .jsonl 和 .json）。"
+             "指定后忽略 --question-file / --question-stage。"
+             "用于读取最终锁定题集等任意路径的题集文件。",
+    )
+    parser.add_argument(
         "--question-stage",
         type=int,
         default=2,
@@ -397,6 +617,14 @@ if __name__ == "__main__":
         help="固定路径模式 P_gold：指定 gold 证据文本文件（每行一题，或单个字符串）。"
              "非 P_gold 忽略；缺省时 P_gold 以空 context 运行（fixture 占位）。",
     )
+    parser.add_argument(
+        "--expected-question-sha256",
+        type=str,
+        default=None,
+        help="固定路径模式：题集文件 SHA-256 锁定值。提供后与题集文件实际哈希"
+             "强制比对，不匹配立即退出（fail-fast，exit 2），绝不清理旧结果后继续运行。"
+             "用于正式实验锁定题集字节；smoke 亦应传入以提前暴露题集漂移。",
+    )
     args = parser.parse_args()
 
     # ==================================================================
@@ -428,15 +656,23 @@ if __name__ == "__main__":
                 )
                 sys.exit(2)
 
-        # 问题文件前缀（与原始路径一致）
-        if args.question_file:
-            question_prefix = args.question_file
-        else:
-            question_prefix = f"{args.question_stage}_stage"
-
+        # 问题文件加载：优先使用 --question-file-path（支持 JSONL 最终锁定题集）
         WORKING_DIR = Path("caches") / args.data_name
-        question_file_path = WORKING_DIR / f"questions/{question_prefix}.json"
-        queries = extract_queries(question_file_path)
+
+        if args.question_file_path:
+            question_file_path = Path(args.question_file_path)
+            queries, question_ids = extract_queries_v2(question_file_path)
+            print(f"Question file: {question_file_path} ({len(queries)} questions, JSONL/dict mode)")
+        else:
+            # 回退到旧逻辑：--question-file / --question-stage + .json 数组
+            if args.question_file:
+                question_prefix = args.question_file
+            else:
+                question_prefix = f"{args.question_stage}_stage"
+            question_file_path = WORKING_DIR / f"questions/{question_prefix}.json"
+            queries = extract_queries(question_file_path)
+            question_ids = [str(i) for i in range(len(queries))]
+            print(f"Question file: {question_file_path} ({len(queries)} questions, legacy mode)")
 
         # 锁定实验输入：问题集文件哈希（gold 文件哈希在加载 gold 后补充）。
         # 写入每条运行记录，保证产物可追溯到确切的输入字节。
@@ -445,9 +681,20 @@ if __name__ == "__main__":
             "gold_context_file_hash": None,
         }
 
+        # 题集哈希强制锁定（fail-fast）：必须在任何 stale 清理/续跑逻辑之前。
+        # 不匹配说明题集内容已漂移，当前产物不得产出，也绝不能"清掉旧结果继续跑"。
+        if args.expected_question_sha256 and not _check_locked_question_hash(
+            args.expected_question_sha256, input_hashes["question_file_hash"]
+        ):
+            sys.exit(2)
+
+        # 题集总题数（截断前）——manifest 用它区分 smoke 截断批次与正式全量批次
+        total_question_count = len(queries)
+
         # smoke test / 调试用：截断问题数
         if args.max_questions is not None:
             queries = queries[: args.max_questions]
+            question_ids = question_ids[: args.max_questions]
             print(f"--max-questions={args.max_questions}: truncated to {len(queries)} questions")
 
         rag = HyperRAG(
@@ -514,7 +761,6 @@ if __name__ == "__main__":
         snap = args.system_snapshot or "nosnap"
         out_base = f"fixed_{route_id}_r{args.repeat_id}_s{args.seed}_{cv_short}_{snap}"
         if args.debug_relax_constraints:
-            # 调试产物显式打标，禁止混入正式实验结果
             out_base = f"DEBUG_{out_base}"
 
         OUT_DIR = WORKING_DIR / "response"
@@ -522,97 +768,168 @@ if __name__ == "__main__":
 
         save_trace = args.save_trace
         validate_trace = args.validate_trace
+        # 结果改 JSONL（每行一条），支持断点续跑追加写
+        result_file = OUT_DIR / f"{out_base}_result.jsonl"
+        error_file = OUT_DIR / f"{out_base}_errors.jsonl"
         trace_file = str(OUT_DIR / f"{out_base}_trace.jsonl") if save_trace else None
+        manifest_file = OUT_DIR / f"{out_base}_manifest.json"
 
-        # gold_context 支持 per-question（list）或共享（str）；
-        # run_fixed_route_and_save 当前按"本次运行统一 gold_context"传入，
-        # 当 gold_context 为 list 时逐题切片（Step 2 正式映射复用此逻辑）。
-        result_file = OUT_DIR / f"{out_base}_result.json"
-        error_file = OUT_DIR / f"{out_base}_errors.json"
+        # --- 断点续跑：按 run_identity（六要素）判定，而非只看 question_id ---
+        # 同一 qid 但 identity 不同 -> 旧记录是其它实验的产物，清理后重跑；
+        # 同 qid 且 identity 一致 -> 真正的中断续跑，跳过不重跑。
+        identity = _run_identity(
+            route_id, args.repeat_id, args.seed, contract.contract_version,
+            args.system_snapshot, input_hashes.get("question_file_hash"),
+        )
+        existing = _load_result_records(str(result_file))
+        processed_ids, stale_ids = _classify_existing_records(existing, identity)
+        if stale_ids:
+            print(f"Resume: {len(stale_ids)} stale records (run identity mismatch, "
+                  f"e.g. different snapshot/seed/question set), cleaning and re-running")
+            _rewrite_jsonl_keep(str(result_file), processed_ids)
+            if trace_file:
+                _rewrite_jsonl_keep(trace_file, processed_ids)
+            _rewrite_jsonl_keep(str(error_file), processed_ids)
+            # 清理后重新加载，确认无残留异身份记录
+            existing = _load_result_records(str(result_file))
+            processed_ids, stale_ids = _classify_existing_records(existing, identity)
+            assert not stale_ids, "stale cleanup failed; aborting to avoid duplicate records"
+        # trace 与 result 对齐（清孤儿行、补缺失行），保证一一对应
+        if trace_file:
+            _rebuild_trace_from_results(str(result_file), trace_file)
+        if processed_ids:
+            print(f"Resume: {len(processed_ids)} questions already processed "
+                  f"(same run identity), skipping")
+        pending = [(q, question_ids[i], i) for i, q in enumerate(queries)
+                   if question_ids[i] not in processed_ids]
+        skipped_count = len(processed_ids)
 
-        # 逐题执行（gold_context 为列表时按索引切片）
-        if isinstance(gold_context, list):
-            loop = always_get_an_event_loop()
-            with open(result_file, "w", encoding="utf-8") as rf, open(
-                error_file, "w", encoding="utf-8"
-            ) as ef:
-                tf = open(trace_file, "w", encoding="utf-8") if trace_file else None
-                rf.write("[\n")
-                first = True
-                for i, q in enumerate(tqdm(queries, desc="Fixed route", unit="query")):
-                    try:
-                        res = loop.run_until_complete(
-                            execute_fixed_route(
-                                q, route_id, contract, rag,
-                                repeat_id=args.repeat_id, repeat_seed=args.seed,
-                                system_snapshot_id=(args.system_snapshot or ""),
-                                save_trace=save_trace, trace_data={},
-                                gold_context=gold_context[i],
-                            )
+        # --- 逐题执行（统一 JSONL 输出，支持 per-question gold 和 shared/none gold）---
+        loop = always_get_an_event_loop()
+        file_mode = "a" if processed_ids else "w"
+        error_count = 0
+        with open(result_file, file_mode, encoding="utf-8") as rf, open(
+            error_file, file_mode, encoding="utf-8"
+        ) as ef:
+            tf = open(trace_file, file_mode, encoding="utf-8") if trace_file else None
+            for q, qid, orig_idx in tqdm(pending, desc="Fixed route", unit="query"):
+                # gold_context: per-question list -> 按原始索引取；否则整值
+                gc = gold_context[orig_idx] if isinstance(gold_context, list) else gold_context
+                try:
+                    res = loop.run_until_complete(
+                        execute_fixed_route(
+                            q, route_id, contract, rag,
+                            repeat_id=args.repeat_id, repeat_seed=args.seed,
+                            system_snapshot_id=(args.system_snapshot or ""),
+                            save_trace=save_trace, trace_data={},
+                            gold_context=gc,
                         )
-                        record = None
-                        if save_trace:
-                            record = build_trace_record(
-                                dict(res["trace_data"]),
-                                question_id=str(i),
-                                run_id=f"{route_id}_r{args.repeat_id}_s{args.seed}_{i}",
-                                route_id=route_id, seed=args.seed,
-                                system_snapshot_id=(args.system_snapshot or ""),
-                                answer_text=res["answer"],
-                                finish_reason=res.get("finish_reason"),
-                                cost=res.get("cost"),
-                            )
-                            if validate_trace:
-                                try:
-                                    validate_and_finalize(record)
-                                except SchemaValidationError as e:
-                                    ef.write(json.dumps(
-                                        {"query": q, "error": f"trace_schema: {e}"},
-                                        ensure_ascii=False, indent=4))
-                                    ef.write("\n")
-                                    continue
-                        out = {
-                            "query": q, "result": res["answer"], "route_id": route_id,
-                            "mode": res["mode"], "context": res["context"],
-                            "prompt_template": "formal_answer_response",
-                            "prompt_hash": res["prompt_hash"],
-                            "contract_version": contract.contract_version,
-                            "repeat_id": args.repeat_id, "seed": args.seed,
-                            "seed_supported": res.get("seed_supported"),
-                            "system_snapshot_id": args.system_snapshot,
-                            "question_file_hash": input_hashes.get("question_file_hash"),
-                            "gold_context_file_hash": input_hashes.get("gold_context_file_hash"),
-                            "trace": record,
-                        }
-                        if not first:
-                            rf.write(",\n")
-                        json.dump(out, rf, ensure_ascii=False, indent=4)
-                        first = False
-                        if record and tf:
-                            tf.write(json.dumps(record, ensure_ascii=False) + "\n")
-                            tf.flush()
-                    except Exception as e:
-                        print("error", e)
-                        ef.write(json.dumps({"query": q, "error": str(e)},
-                                            ensure_ascii=False, indent=4))
-                        ef.write("\n")
-                rf.write("\n]")
-                if tf:
-                    tf.close()
-        else:
-            run_fixed_route_and_save(
-                queries, rag, contract, route_id,
-                repeat_id=args.repeat_id, seed=args.seed,
-                system_snapshot_id=(args.system_snapshot or ""),
-                output_file=str(result_file), error_file=str(error_file),
-                trace_file=trace_file, save_trace=save_trace,
-                validate_trace=validate_trace, gold_context=gold_context,
-                input_hashes=input_hashes,
-            )
+                    )
+                    record = None
+                    if save_trace:
+                        # 用执行器返回的规范化 trace_out（res["trace_data"]），
+                        # 而非外部容器 —— 它含 P0/P_gold 的 token 补齐等最终修正。
+                        record = build_trace_record(
+                            res["trace_data"],
+                            question_id=str(qid),
+                            run_id=f"{route_id}_r{args.repeat_id}_s{args.seed}_{qid}",
+                            route_id=route_id, seed=args.seed,
+                            system_snapshot_id=(args.system_snapshot or ""),
+                            answer_text=res["answer"],
+                            finish_reason=res.get("finish_reason"),
+                            cost=res.get("cost"),
+                        )
+                        if validate_trace:
+                            try:
+                                validate_and_finalize(record)
+                            except SchemaValidationError as e:
+                                ef.write(json.dumps(
+                                    {"question_id": str(qid), "query": q,
+                                     "error": f"trace_schema: {e}"},
+                                    ensure_ascii=False))
+                                ef.write("\n")
+                                ef.flush()
+                                error_count += 1
+                                continue
+                    out = {
+                        "question_id": str(qid),
+                        "query": q, "result": res["answer"], "route_id": route_id,
+                        "mode": res["mode"], "context": res["context"],
+                        "prompt_template": "formal_answer_response",
+                        "prompt_hash": res["prompt_hash"],
+                        "contract_version": contract.contract_version,
+                        "repeat_id": args.repeat_id, "seed": args.seed,
+                        "seed_supported": res.get("seed_supported"),
+                        "system_snapshot_id": args.system_snapshot,
+                        "question_file_hash": input_hashes.get("question_file_hash"),
+                        "gold_context_file_hash": input_hashes.get("gold_context_file_hash"),
+                        "trace": record,
+                    }
+                    # result + trace 成对写入（先 result 后 trace，双 flush）
+                    _write_record_pair(rf, tf, out, record)
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    print("error", e)
+                    ef.write(json.dumps(
+                        {"question_id": str(qid), "query": q, "error": str(e)},
+                        ensure_ascii=False))
+                    ef.write("\n")
+                    ef.flush()
+                    error_count += 1
+            if tf:
+                tf.close()
+
+        # 运行收尾：trace 再对齐一次（覆盖"result 写完、trace 未写"即崩溃的窗口）
+        if trace_file:
+            _rebuild_trace_from_results(str(result_file), trace_file)
+
+        # --- 写实验 manifest（题集哈希、代码指纹、参数、累计计数、状态、时间）---
+        from datetime import datetime, timezone
+        from hyperrag.system_snapshot import compute_runtime_source_fingerprint
+        from hyperrag.fixed_route_executor import formal_answer_prompt_hash
+        src_fp = compute_runtime_source_fingerprint()
+        # 累计完成数 = 文件内成功记录数（含本次续跑前已完成的），以 result 为准
+        cumulative_processed = len(_load_result_records(str(result_file)))
+        requested_count = len(queries)          # 本次运行配置的问题数（截断后）
+        truncated = args.max_questions is not None
+        status = _compute_run_status(cumulative_processed, requested_count, error_count)
+        manifest = {
+            "route_id": route_id,
+            "repeat_id": args.repeat_id,
+            "seed": args.seed,
+            "contract_version": contract.contract_version,
+            "system_snapshot_id": args.system_snapshot,
+            "question_file_path": str(question_file_path),
+            "question_file_sha256": input_hashes.get("question_file_hash"),
+            "question_file_total": total_question_count,   # 题集总题数（未截断）
+            "requested_count": requested_count,            # 本次配置处理题数（截断后）
+            "truncated": truncated,                        # True=smoke 截断批次，不可当全量
+            "cumulative_processed": cumulative_processed,  # 文件累计成功记录数
+            "skipped_count": skipped_count,                # 本次跳过（身份一致已存在）
+            "error_count": error_count,                    # 本次失败数
+            "status": status,                              # complete / incomplete
+            "temperature": contract.system_boundary.temperature,
+            "max_response_tokens": contract.system_boundary.max_response_tokens,
+            "llm_response_cache": contract.system_boundary.llm_response_cache,
+            "runtime_source_fingerprint": src_fp["runtime_source_fingerprint"],
+            "runtime_source_file_count": src_fp["runtime_source_file_count"],
+            "prompt_hash": formal_answer_prompt_hash(),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _write_run_manifest(str(manifest_file), manifest)
 
         print(f"Fixed route {route_id} done. Results: {result_file}")
         if trace_file:
             print(f"Trace: {trace_file}")
+        print(f"Manifest: {manifest_file}")
+        # 运行状态门禁：status=incomplete 必须以非零退出码结束，
+        # 让调用方（CI / 批量脚本）能明确感知"本批实验未完整完成"。
+        if status != "complete":
+            print(f"ERROR: run status={status} (incomplete) — "
+                  f"cumulative_processed={cumulative_processed}, "
+                  f"requested_count={requested_count}, error_count={error_count}")
+            sys.exit(1)
         sys.exit(0)
 
     data_name = args.data_name
