@@ -67,7 +67,7 @@ ADJUDICATION_RULE_VERSION = "v2"    # verdict 判定规则版本（冻结点之�
 # 接收 evidence_requirements（requirement_id/answer_unit_ids/alternative_chunk_ids），
 # 返回 {requirement_hits, er_recall, complete_evidence_hit}。
 # P2-P4 只搜索 -----Sources----- 区段（§8.3 line 528），P1/P_gold 全文。非冻结项（审计字段）。
-COVERAGE_RULE_VERSION = "v3"
+COVERAGE_RULE_VERSION = "v3.1"
 
 # 原始 480 条 LLM 调用的脚本版本历史（r0_s42_5c92f17c，2026-08-12 晚 ~ 08-13 凌晨）。
 # judge_longcat.py 直到 8c67a0e 才首次提交，此前版本均不可从 git 回溯：
@@ -302,9 +302,13 @@ def calc_source_evidence_coverage(context, evidence_requirements, spans_by_unit,
     for er in evidence_requirements:
         er_id = er.get("requirement_id", "?")
         au_ids = er.get("answer_unit_ids", [])
+        allowed_chunks = set(er.get("alternative_chunk_ids", []))
         hit = False
         for au_id in au_ids:
             for span in spans_by_unit.get(au_id, []):
+                # 只允许 ER 声明的 alternative_chunk_ids 中的 span 贡献命中
+                if allowed_chunks and span.get("chunk_id") not in allowed_chunks:
+                    continue
                 q = normalize_ws(span.get("quote"))
                 if q and q in ctx_n:
                     hit = True

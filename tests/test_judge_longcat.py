@@ -1,11 +1,12 @@
-"""Judge 契约测试（judge_longcat.py v1.3.0，2026-08-13 步骤 3 二次修正）。
+"""Judge 契约测试（judge_longcat.py v1.3.1，2026-08-14 ER alternative_chunk_ids 过滤）。
 
 Coverage:
 1. ER 级证据覆盖：evidence_requirements 组间 AND + 组内 OR（多 AU/多 chunk）。
-2. 搜索范围：P1/P_gold 全文 vs P2-P4 仅 -----Sources----- 区段。
-3. combine_route_success 三值 AND：coverage=False 硬 fail（不被 human_review 悬置）。
-4. P0 无 evidence gate：route_success = final_answer_correctness。
-5. manifest 双哈希分离：raw_judge_script_hashes 只含可校验哈希；
+2. alternative_chunk_ids 过滤：只有 ER 声明的 chunk 的 span 才贡献命中。
+3. 搜索范围：P1/P_gold 全文 vs P2-P4 仅 -----Sources----- 区段。
+4. combine_route_success 三值 AND：coverage=False 硬 fail（不被 human_review 悬置）。
+5. P0 无 evidence gate：route_success = final_answer_correctness。
+6. manifest 双哈希分离：raw_judge_script_hashes 只含可校验哈希；
    raw_generation_configs 保留完整条目（含 hash_status）。
 """
 
@@ -40,7 +41,7 @@ def test_er_return_format():
     ctx = "Lott IT 1978 报告原文在此。"
     ers = [{"requirement_id": "ER1", "answer_unit_ids": ["AU1"],
             "alternative_chunk_ids": ["chunk-a"]}]
-    spans = {"AU1": [{"quote": "Lott IT 1978"}]}
+    spans = {"AU1": [{"chunk_id": "chunk-a", "quote": "Lott IT 1978"}]}
     result = j.calc_source_evidence_coverage(ctx, ers, spans, search="full")
     assert isinstance(result, dict)
     assert set(result.keys()) == {"requirement_hits", "er_recall", "complete_evidence_hit"}
@@ -54,7 +55,8 @@ def test_er_group_or_alternative_sources_hit():
     ctx = "本文包含 Lott IT 1978 年的报告原文。"
     ers = [{"requirement_id": "ER1", "answer_unit_ids": ["AU1"],
             "alternative_chunk_ids": ["chunk-a"]}]
-    spans = {"AU1": [{"quote": "A 不存在的文本"}, {"quote": "Lott IT 1978"}]}
+    spans = {"AU1": [{"chunk_id": "chunk-a", "quote": "A 不存在的文本"},
+                     {"chunk_id": "chunk-a", "quote": "Lott IT 1978"}]}
     result = j.calc_source_evidence_coverage(ctx, ers, spans, search="full")
     assert result["requirement_hits"] == {"ER1": True}
     assert result["complete_evidence_hit"] is True
@@ -65,7 +67,8 @@ def test_er_group_or_all_miss():
     ctx = "无相关内容"
     ers = [{"requirement_id": "ER1", "answer_unit_ids": ["AU1"],
             "alternative_chunk_ids": ["chunk-a"]}]
-    spans = {"AU1": [{"quote": "X 不存在"}, {"quote": "Y 也不存在"}]}
+    spans = {"AU1": [{"chunk_id": "chunk-a", "quote": "X 不存在"},
+                     {"chunk_id": "chunk-a", "quote": "Y 也不存在"}]}
     result = j.calc_source_evidence_coverage(ctx, ers, spans, search="full")
     assert result["requirement_hits"] == {"ER1": False}
     assert result["complete_evidence_hit"] is False
@@ -82,8 +85,8 @@ def test_er_group_and_partial_hit():
          "alternative_chunk_ids": ["chunk-b"]},
     ]
     spans = {
-        "AU1": [{"quote": "Lott IT 1978"}],
-        "AU2": [{"quote": "Matalon 1988 缺失"}],
+        "AU1": [{"chunk_id": "chunk-a", "quote": "Lott IT 1978"}],
+        "AU2": [{"chunk_id": "chunk-b", "quote": "Matalon 1988 缺失"}],
     }
     result = j.calc_source_evidence_coverage(ctx, ers, spans, search="full")
     assert result["requirement_hits"] == {"ER1": True, "ER2": False}
@@ -101,8 +104,8 @@ def test_er_group_and_all_hit():
          "alternative_chunk_ids": ["chunk-b"]},
     ]
     spans = {
-        "AU1": [{"quote": "Lott IT 1978"}],
-        "AU2": [{"quote": "Matalon 1988"}],
+        "AU1": [{"chunk_id": "chunk-a", "quote": "Lott IT 1978"}],
+        "AU2": [{"chunk_id": "chunk-b", "quote": "Matalon 1988"}],
     }
     result = j.calc_source_evidence_coverage(ctx, ers, spans, search="full")
     assert result["requirement_hits"] == {"ER1": True, "ER2": True}
@@ -116,8 +119,8 @@ def test_er_multi_au_one_er():
     ers = [{"requirement_id": "ER1", "answer_unit_ids": ["AU1", "AU2"],
             "alternative_chunk_ids": ["chunk-a", "chunk-b"]}]
     spans = {
-        "AU1": [{"quote": "不存在的文本 AAA"}],
-        "AU2": [{"quote": "Q fever is probably contracted by inhalation."}],
+        "AU1": [{"chunk_id": "chunk-a", "quote": "不存在的文本 AAA"}],
+        "AU2": [{"chunk_id": "chunk-b", "quote": "Q fever is probably contracted by inhalation."}],
     }
     result = j.calc_source_evidence_coverage(ctx, ers, spans, search="full")
     assert result["requirement_hits"] == {"ER1": True}
@@ -130,8 +133,8 @@ def test_er_multi_au_all_miss():
     ers = [{"requirement_id": "ER1", "answer_unit_ids": ["AU1", "AU2"],
             "alternative_chunk_ids": ["chunk-a", "chunk-b"]}]
     spans = {
-        "AU1": [{"quote": "不存在 AAA"}],
-        "AU2": [{"quote": "不存在 BBB"}],
+        "AU1": [{"chunk_id": "chunk-a", "quote": "不存在 AAA"}],
+        "AU2": [{"chunk_id": "chunk-b", "quote": "不存在 BBB"}],
     }
     result = j.calc_source_evidence_coverage(ctx, ers, spans, search="full")
     assert result["requirement_hits"] == {"ER1": False}
@@ -142,7 +145,7 @@ def test_er_no_answer_unit_ids_strict_false():
     ctx = "有内容"
     ers = [{"requirement_id": "ER1", "answer_unit_ids": [],
             "alternative_chunk_ids": ["chunk-a"]}]
-    spans = {"AU1": [{"quote": "有内容"}]}
+    spans = {"AU1": [{"chunk_id": "chunk-a", "quote": "有内容"}]}
     result = j.calc_source_evidence_coverage(ctx, ers, spans, search="full")
     assert result["requirement_hits"] == {"ER1": False}
     assert result["complete_evidence_hit"] is False
@@ -153,7 +156,7 @@ def test_er_au_without_spans_strict_false():
     ctx = "有内容"
     ers = [{"requirement_id": "ER1", "answer_unit_ids": ["AU1", "AU2"],
             "alternative_chunk_ids": ["chunk-a"]}]
-    spans = {"AU1": [{"quote": "有内容"}]}  # AU2 无 spans
+    spans = {"AU1": [{"chunk_id": "chunk-a", "quote": "有内容"}]}  # AU2 无 spans
     result = j.calc_source_evidence_coverage(ctx, ers, spans, search="full")
     # AU1 hit 但 AU2 无 span -> OR 内 AU2 不贡献，AU1 命中即 ER hit
     # 实际：AU1 有 span 且命中 -> ER1=True（OR 语义：任一 AU 命中即可）
@@ -165,7 +168,7 @@ def test_whitespace_normalization():
     ctx = "Lott IT, Coulombe T,\nDiPaolo RV: X 报告。\n\n后续"
     ers = [{"requirement_id": "ER1", "answer_unit_ids": ["AU1"],
             "alternative_chunk_ids": ["chunk-a"]}]
-    spans = {"AU1": [{"quote": "Lott IT, Coulombe T, DiPaolo RV: X 报告。"}]}
+    spans = {"AU1": [{"chunk_id": "chunk-a", "quote": "Lott IT, Coulombe T, DiPaolo RV: X 报告。"}]}
     result = j.calc_source_evidence_coverage(ctx, ers, spans, search="full")
     assert result["complete_evidence_hit"] is True
 
@@ -177,6 +180,46 @@ def test_empty_evidence_requirements():
     assert result["requirement_hits"] == {}
     assert result["er_recall"] == 0.0
     assert result["complete_evidence_hit"] is False
+
+
+# ---------------------------------------------------------------------------
+# alternative_chunk_ids 过滤（v1.3.1 新增）
+# ---------------------------------------------------------------------------
+def test_er_alternative_chunk_ids_filter():
+    """只有 ER 声明的 alternative_chunk_ids 中的 span 才贡献命中。
+
+    AU 同时拥有 allowed 和 non-allowed span，只有 non-allowed quote 命中时，
+    ER 必须为 False（non-allowed span 属于其他 evidence group，不能满足本 ER）。
+    """
+    ctx = "Q fever is probably contracted by inhalation."
+    ers = [{"requirement_id": "ER1", "answer_unit_ids": ["AU1"],
+            "alternative_chunk_ids": ["chunk-allowed"]}]
+    # AU1 有两个 span：allowed（miss）+ non-allowed（hit）
+    # non-allowed span 的 quote 虽然命中 context，但 chunk_id 不在 allowed_chunks 中
+    spans = {"AU1": [
+        {"chunk_id": "chunk-allowed", "quote": "不存在的文本"},
+        {"chunk_id": "chunk-other", "quote": "Q fever is probably contracted by inhalation."},
+    ]}
+    result = j.calc_source_evidence_coverage(ctx, ers, spans, search="full")
+    assert result["requirement_hits"] == {"ER1": False}
+    assert result["complete_evidence_hit"] is False
+    # 对照：把 non-allowed span 的 chunk_id 改为 allowed -> 必须 hit
+    spans2 = {"AU1": [
+        {"chunk_id": "chunk-allowed", "quote": "不存在的文本"},
+        {"chunk_id": "chunk-allowed", "quote": "Q fever is probably contracted by inhalation."},
+    ]}
+    result2 = j.calc_source_evidence_coverage(ctx, ers, spans2, search="full")
+    assert result2["requirement_hits"] == {"ER1": True}
+
+
+def test_er_empty_alternative_chunk_ids_no_filter():
+    """alternative_chunk_ids 为空时不过滤（向后兼容无 chunk 归属的数据）。"""
+    ctx = "有内容在此。"
+    ers = [{"requirement_id": "ER1", "answer_unit_ids": ["AU1"],
+            "alternative_chunk_ids": []}]
+    spans = {"AU1": [{"chunk_id": "any-chunk", "quote": "有内容在此。"}]}
+    result = j.calc_source_evidence_coverage(ctx, ers, spans, search="full")
+    assert result["requirement_hits"] == {"ER1": True}
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +254,7 @@ def test_p2p4_sources_only_excludes_entities():
     """P2-P4（search='sources'）：Entities/Relationships 区段的文本不贡献 hit。"""
     ers = [{"requirement_id": "ER1", "answer_unit_ids": ["AU1"],
             "alternative_chunk_ids": ["chunk-a"]}]
-    spans = {"AU1": [{"quote": "Lott IT 1978"}]}
+    spans = {"AU1": [{"chunk_id": "chunk-a", "quote": "Lott IT 1978"}]}
     ctx = (
         "-----Entities-----\n"
         "Lott IT 1978 研究者条目\n"
@@ -233,7 +276,7 @@ def test_p1_pgold_full_search_hits_anywhere():
     ctx = "Lott IT, Coulombe T, DiPaolo RV, et al: Vitamin B6-dependent seizures. Neurology 28:47, 1978."
     ers = [{"requirement_id": "ER1", "answer_unit_ids": ["AU1"],
             "alternative_chunk_ids": ["chunk-a"]}]
-    spans = {"AU1": [{"quote": "Vitamin B6-dependent seizures. Neurology 28:47, 1978"}]}
+    spans = {"AU1": [{"chunk_id": "chunk-a", "quote": "Vitamin B6-dependent seizures. Neurology 28:47, 1978"}]}
     result = j.calc_source_evidence_coverage(ctx, ers, spans, search="full")
     assert result["complete_evidence_hit"] is True
 
