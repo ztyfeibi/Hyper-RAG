@@ -37,7 +37,7 @@ SEED = 42
 
 
 def load_questions_with_spans():
-    """qid -> {question, answer_units, evidence_spans_by_au}"""
+    """qid -> {question, answer_units, evidence_spans_by_au, evidence_requirements}"""
     out = {}
     for line in open(j.QUESTIONS_FILE, encoding="utf-8"):
         r = json.loads(line)
@@ -47,6 +47,7 @@ def load_questions_with_spans():
             "question": r["question"],
             "answer_units": r.get("answer_units", []),
             "evidence_spans": spans_by_au,
+            "evidence_requirements": r.get("evidence_requirements", []),
         }
     return out
 
@@ -64,7 +65,7 @@ def load_candidate_answers():
 
 
 def compute_coverage(route, qid, question_meta, evidence_by_qid):
-    """source_evidence_coverage 命中（与 judge_longcat summary 同规则）。"""
+    """source_evidence_coverage 命中（与 judge_longcat summary 同规则，ER 级）。"""
     if route == "P0":
         return True  # 无证据门槛
     rf = j.result_file(route, 0, 42, j.SNAPSHOT_DEFAULT)
@@ -76,11 +77,11 @@ def compute_coverage(route, qid, question_meta, evidence_by_qid):
             break
     if ctx is None:
         return False
-    required = {u["unit_id"] for u in question_meta["answer_units"] if u.get("required", True)}
-    _, all_hit = j.calc_source_evidence_coverage(
-        ctx, evidence_by_qid.get(qid, {}), required,
+    ers = question_meta.get("evidence_requirements", [])
+    result = j.calc_source_evidence_coverage(
+        ctx, ers, evidence_by_qid.get(qid, {}),
         search="sources" if route in ("P2", "P3", "P4") else "full")
-    return all_hit
+    return result["complete_evidence_hit"]
 
 
 def describe_au_counts(n_au):
@@ -223,11 +224,83 @@ def render_record(idx, r, questions, show_judge=False):
     lines.append("- 整体 verdict: [pass|fail|uncertain]")
     lines.append("- unsupported 致命性: [无|全部无害|有致命]（若候选答案含证据外的陈述，"
                  "判断其为无害背景信息还是致命错误）")
+    lines.append("- unsupported claims 详情（逐条列出候选答案中超出证据的陈述，标注状态）:")
+    lines.append("  - claim: \"...\" status: [supported_by_source|unsupported_noncritical|contradicted|unverifiable]")
+    lines.append("  （若无超出证据的陈述，填空列表；可多行）")
     lines.append("- 备注: ")
     lines.append("")
     lines.append("---")
     lines.append("")
     return "\n".join(lines)
+
+
+def sample_neg_controls(recs, rng, n=20):
+    """从 P_gold unsupported 阴性样本（n_unsupported=0）中随机抽取阴性对照。
+
+    P_gold 80 条中 37 条 unsupported 阴性（Judge 未标 unsupported），
+    抽取 ~20 条用于校准 Judge 的 false-negative。
+    """
+    pool = [r for r in recs if r["route"] == "P_gold"
+            and r["n_unsupported"] == 0 and not r["human_review"]]
+    rng.shuffle(pool)
+    return pool[:n]
+
+
+def write_verdicts_template(path, all_rows):
+    """生成 verdicts_template.jsonl：每行一条判定模板（含 per-claim unsupported_claims）。"""
+    with open(path, "w", encoding="utf-8") as f:
+        for r in all_rows:
+            entry = {
+                "blind_id": r["blind_id"],
+                "au_status": {},
+                "verdict": "",
+                "unsupported_fatality": "",
+                "unsupported_claims": [],
+                "notes": "",
+            }
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+REVIEW_GUIDE_TEXT = """# 盲审人工审核指引
+
+## 任务
+对照每条的 Question / Answer units / Evidence spans，对 Candidate answer 做 source-grounded 判定。
+**不要看 set 文件以外的东西**，不知道路径名（P0-P4/P_gold）与模型来源。
+
+## 判定规则（与契约 §12.2/§8.3 对齐）
+1. **AU 状态**（逐 AU 判）：
+   - supported: 候选答案陈述了该 AU 的 claim 且与 evidence span 一致；
+   - missing: 候选答案未覆盖该 AU 的 claim（或只有含糊提及、无实质内容）；
+   - contradicted: 候选答案陈述与 evidence span 直接矛盾（如错误年份/作者/结论）。
+2. **整体 verdict**：
+   - pass: 全部 required AU 均 supported，且无致命 unsupported claim；
+   - fail: 任一 required AU contradicted，或存在致命 unsupported claim（与证据冲突、误导性错误信息）；
+   - uncertain: 证据不足（无法从 evidence 判定）、AU 部分 missing 但非矛盾、或候选答案含糊无法判定。
+3. **unsupported_fatality**：
+   - none: 候选答案没有超出证据的陈述；
+   - harmless: 有超出证据的陈述，但是无害背景/常识性补充（不误导）；
+   - fatal: 有超出证据且错误/误导的陈述（虚假引用、错误数据、与证据矛盾）。
+4. **unsupported_claims 详情**（逐条）：
+   - supported_by_source: 该陈述实际可在 evidence span 中找到依据（Judge 误判为 unsupported）；
+   - unsupported_noncritical: 超出证据但无害（背景信息、常识）；
+   - contradicted: 与证据直接矛盾；
+   - unverifiable: 无法从给定 evidence 判定真伪。
+
+## 阴性对照（set_C）
+set_C 的候选答案理论上不含 unsupported claims（Judge 未检出）。若你发现 unsupported，
+说明 Judge 存在 false-negative（漏检）；若确认无 unsupported，说明 Judge 判定正确。
+
+## 填写方式
+编辑 verdicts_template.jsonl，每行填：
+- au_status: {AU1: supported, AU2: missing, ...}
+- verdict: pass/fail/uncertain
+- unsupported_fatality: none/harmless/fatal
+- unsupported_claims: [{"claim": "...", "status": "supported_by_source|unsupported_noncritical|contradicted|unverifiable"}]
+  （若无超出证据的陈述，填空列表 []）
+- notes: 可选备注
+
+填完存为 verdicts_annotated.jsonl（或直接在模板上改后告知我文件名）。
+"""
 
 
 def main():
@@ -247,6 +320,9 @@ def main():
     # ---- set_B：P_gold 43 条 pending 全量 ----
     set_b = [r for r in recs if r["route"] == "P_gold" and r["human_review"]]
     assert len(set_b) == 43, f"P_gold pending 应为 43，实际 {len(set_b)}"
+    # ---- set_C：P_gold unsupported 阴性对照 ~20 条 ----
+    set_c = sample_neg_controls(recs, rng, n=20)
+    print(f"set_C 阴性对照: {len(set_c)} 条（P_gold unsupported-negative）")
 
     BLIND_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -264,11 +340,16 @@ def main():
 
     write_md(BLIND_DIR / "set_A_main_100.md", set_a, start_idx=1)
     write_md(BLIND_DIR / "set_B_pgold_pending_43.md", set_b, start_idx=101)
+    write_md(BLIND_DIR / "set_C_neg_control_20.md", set_c, start_idx=144)
 
     # ---- manifest：审核 ID <-> qid/route 映射（内部，不随材料分发）----
     manifest = {"seed": args.seed, "generated_at": __import__("datetime").datetime.now(
         __import__("datetime").timezone.utc).isoformat()}
-    for name, rows in (("set_A_main_100", set_a), ("set_B_pgold_pending_43", set_b)):
+    sets = [("set_A_main_100", set_a, 1),
+            ("set_B_pgold_pending_43", set_b, 101),
+            ("set_C_neg_control_20", set_c, 144)]
+    all_rows_for_template = []
+    for name, rows, start in sets:
         manifest[name] = [{"blind_id": f"BL-{i:03d}",
                            "route": r["route"], "qid": r["qid"],
                            "verdict": r["verdict"], "derived": r["derived"],
@@ -278,9 +359,17 @@ def main():
                            "cov_hit": r["cov_hit"],
                            "n_unsupported": r["n_unsupported"],
                            "has_contradicted": r["has_contradicted"]}
-                          for i, r in enumerate(rows, start=101 if "B" in name else 1)]
+                          for i, r in enumerate(rows, start=start)]
+        all_rows_for_template.extend(
+            [{"blind_id": f"BL-{i:03d}"} for i, _ in enumerate(rows, start=start)])
     (BLIND_DIR / "sample_manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # ---- verdicts_template.jsonl（含 per-claim unsupported_claims 字段）----
+    write_verdicts_template(BLIND_DIR / "verdicts_template.jsonl", all_rows_for_template)
+
+    # ---- REVIEW_GUIDE.md ----
+    (BLIND_DIR / "REVIEW_GUIDE.md").write_text(REVIEW_GUIDE_TEXT, encoding="utf-8")
 
     # ---- 分层覆盖统计 ----
     def stats(rows):
@@ -301,8 +390,13 @@ def main():
     print("\n=== set_B（P_gold pending 43 条）分层覆盖 ===")
     for k, v in sorted(stats(set_b).items()):
         print(f"  {k}: {v}")
+    print(f"\n=== set_C（阴性对照 {len(set_c)} 条）分层覆盖 ===")
+    for k, v in sorted(stats(set_c).items()):
+        print(f"  {k}: {v}")
+    total = len(set_a) + len(set_b) + len(set_c)
     print(f"\n产物: {BLIND_DIR}/")
-    print("  set_A_main_100.md / set_B_pgold_pending_43.md / sample_manifest.json")
+    print(f"  set_A_main_100.md / set_B_pgold_pending_43.md / set_C_neg_control_20.md")
+    print(f"  sample_manifest.json / verdicts_template.jsonl ({total} 条) / REVIEW_GUIDE.md")
 
 
 if __name__ == "__main__":

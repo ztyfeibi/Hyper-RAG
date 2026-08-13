@@ -54,18 +54,20 @@ normalize_proxy_env()
 # ---------------------------------------------------------------------------
 # 版本 / 常量
 # ---------------------------------------------------------------------------
-JUDGE_VERSION = "v1.2.0"            # judge 实现版本（每次改 prompt/规则递增）
+JUDGE_VERSION = "v1.3.0"            # judge 实现版本（每次改 prompt/规则递增）
 JSON_SCHEMA_VERSION = "v1"          # 输出 JSON schema 版本
 # v2（2026-08-13）：unsupported_claims / critical_error 不再自动派生 fail，
 # 而是悬置为 uncertain 并进入人工复核（契约 §12.1 line 867：uncertain/unsupported/
 # critical/矛盾 一律进人工复核，不由规则直接判死）。prompt 未变 -> prompt hash 不变，
 # 已产出的 480 条原始 LLM 输出可直接离线重裁决（--mode rejudge），无需重新请求 LongCat。
 ADJUDICATION_RULE_VERSION = "v2"    # verdict 判定规则版本（冻结点之一）
-# v2（2026-08-13）：证据组覆盖判定。v1 = 全 context 子串搜索；
-# v2 = evidence requirement 组间 AND + alternative source 组内 OR，
-# 且 P2-P4 只搜索 -----Sources----- 区段（Entities/Relationships 区段不能贡献 source hit，
-# §8.3 line 528）。P1/P_gold 纯 source 文本无标记，全文即 Sources。非冻结项（审计字段）。
-COVERAGE_RULE_VERSION = "v2"
+# v3（2026-08-13）：真正按 evidence_requirements 计算 ER 级覆盖。
+# v2 = AU 级 AND（接收 required_units，碰巧与 ER 1:1 时等价）。
+# v3 = evidence requirement 组间 AND + alternative source 组内 OR，
+# 接收 evidence_requirements（requirement_id/answer_unit_ids/alternative_chunk_ids），
+# 返回 {requirement_hits, er_recall, complete_evidence_hit}。
+# P2-P4 只搜索 -----Sources----- 区段（§8.3 line 528），P1/P_gold 全文。非冻结项（审计字段）。
+COVERAGE_RULE_VERSION = "v3"
 
 # 原始 480 条 LLM 调用的脚本版本历史（r0_s42_5c92f17c，2026-08-12 晚 ~ 08-13 凌晨）。
 # judge_longcat.py 直到 8c67a0e 才首次提交，此前版本均不可从 git 回溯：
@@ -73,12 +75,14 @@ COVERAGE_RULE_VERSION = "v2"
 # - max_tokens=6000 补跑版：39 条缺口/parse_fail 补跑（修复 JSON 截断），哈希不可回溯
 # 现文件（离线裁决器）哈希独立记录为 adjudicator_script_hash，不冒充原始调用环境。
 RAW_JUDGE_SCRIPT_HISTORY = [
-    {"script_hash": "91447b21…a7f3f9d（未提交，用户快照）",
+    {"script_hash": "91447b212e79b9c8f31bd01cbd880f2232bddc3059433502cae39d018a7f3f9d",
+     "hash_status": "verified",
      "temperature": 0.0, "max_tokens": 3000,
-     "note": "主跑 480 条 + 首次补跑 85 条（部分被双进程踩踏后由用户重跑成功）"},
-    {"script_hash": "unrecoverable（未提交）",
+     "note": "主跑 480 条 + 首次补跑 85 条（未提交，用户快照）"},
+    {"script_hash": None,
+     "hash_status": "unrecoverable",
      "temperature": 0.0, "max_tokens": 6000,
-     "note": "39 条缺口/parse_fail 补跑（MAX_TOKENS 3000->6000 修复截断后）"},
+     "note": "39 条缺口/parse_fail 补跑（MAX_TOKENS 3000->6000 修复截断后，未提交不可回溯）"},
 ]
 RETRY_POLICY = {
     "json_parse_retry": 1,          # JSON 解析失败重试次数（契约：一次，针对解析层）
@@ -242,6 +246,19 @@ def load_evidence_spans():
     return out
 
 
+def load_evidence_requirements():
+    """qid -> [evidence_requirements]（ER→answer_unit_ids+alternative_chunk_ids）。
+
+    每条 ER: {requirement_id, answer_unit_ids, alternative_chunk_ids}。
+    组间 AND（所有 ER 必须满足）+ 组内 OR（ER 关联的任一 AU 的任一 span 命中即满足）。
+    """
+    out = {}
+    for line in open(QUESTIONS_FILE, encoding="utf-8"):
+        r = json.loads(line)
+        out[r["question_id"]] = r.get("evidence_requirements", [])
+    return out
+
+
 def normalize_ws(s) -> str:
     """空白归一化（覆盖判定用；原文引文与组装后 context 的换行/缩进可能不同）。"""
     return re.sub(r"\s+", " ", (s or "")).strip()
@@ -265,35 +282,45 @@ def extract_sources_section(context) -> str:
     return c
 
 
-def calc_source_evidence_coverage(context, spans_by_unit, required_units, search="full"):
-    """确定性、可审计、不调 LLM 的证据组覆盖判定（§8.3 line 528 + coverage_rule_version=v2）。
+def calc_source_evidence_coverage(context, evidence_requirements, spans_by_unit,
+                                  search="full"):
+    """ER 级证据组覆盖判定（§8.3 line 528 + coverage_rule_version=v3）。
 
-    - evidence requirement 组间 AND：每个 required AU（有 evidence_spans 的）都必须满足；
-      无 evidence_spans 的 required AU 视为未满足（严格：required AU 必须有证据）。
-    - alternative source 组内 OR：AU 的任一 evidence span quote（空白归一化后）作为子串
-      命中搜索文本即满足该组。
-    - search="full"（P1/P_gold）：整个 context 即 Sources；search="sources"（P2-P4）：
+    - evidence requirement 组间 AND：每个 ER 都必须满足（all_hit = all ERs hit）。
+    - alternative source 组内 OR：ER 关联的任一 AU 的任一 evidence span quote
+      （空白归一化后）作为子串命中搜索文本即满足该 ER。
+    - 无 answer_unit_ids 或 AU 无 spans 的 ER 严格判 False（必须有证据）。
+    - search="full"（P1/P_gold）：整个 context；search="sources"（P2-P4）：
       仅 -----Sources----- 区段（Entities/Relationships 区段不能贡献 source hit）。
 
-    返回 (per_au_hit, all_hit)。
+    返回 {"requirement_hits": {er_id: bool}, "er_recall": float,
+          "complete_evidence_hit": bool}。
     """
     ctx_n = normalize_ws(
         extract_sources_section(context) if search == "sources" else context)
-    per_au = {}
-    for u in required_units:
-        spans = spans_by_unit.get(u) or []
-        if not spans:
-            per_au[u] = False
-            continue
+    requirement_hits = {}
+    for er in evidence_requirements:
+        er_id = er.get("requirement_id", "?")
+        au_ids = er.get("answer_unit_ids", [])
         hit = False
-        for s in spans:
-            q = normalize_ws(s.get("quote"))
-            if q and q in ctx_n:
-                hit = True
+        for au_id in au_ids:
+            for span in spans_by_unit.get(au_id, []):
+                q = normalize_ws(span.get("quote"))
+                if q and q in ctx_n:
+                    hit = True
+                    break
+            if hit:
                 break
-        per_au[u] = hit
-    all_hit = bool(required_units) and all(per_au.values())
-    return per_au, all_hit
+        requirement_hits[er_id] = hit
+    total = len(evidence_requirements)
+    hit_count = sum(1 for v in requirement_hits.values() if v)
+    er_recall = round(hit_count / total, 4) if total else 0.0
+    complete = bool(total) and all(requirement_hits.values())
+    return {
+        "requirement_hits": requirement_hits,
+        "er_recall": er_recall,
+        "complete_evidence_hit": complete,
+    }
 
 
 def final_answer_correctness(derived, human_review):
@@ -306,18 +333,34 @@ def final_answer_correctness(derived, human_review):
 
 
 def combine_route_success(final_ac, cov_hit, has_evidence_gate, human_review):
-    """route_success 三层组合（§8.3 line 518-520）：
-    - human_review=true -> pending（等人工裁决，不因 cov 提前判死）
-    - P0 无证据门槛：route_success = final_answer_correctness
-    - P1-P4/P_gold 双门槛：final_ac=pass AND cov_hit -> pass；否则 fail/pending
+    """route_success = coverage AND answer_correctness（三值逻辑，§8.3 line 518-520）。
+
+    coverage 失败是确定性 fail，不被 human_review 悬置——证据缺失是客观事实，
+    不依赖人工裁决。只有 coverage 通过且 answer_correctness=pending 时才 pending。
+    final_ac 已由 final_answer_correctness() 计算（含 human_review→pending），故
+    human_review 参数在此不再短路，仅保留签名兼容。
+
+    真值表：
+      coverage=False                     → fail
+      coverage=True  + answer=pass       → pass
+      coverage=True  + answer=fail       → fail
+      coverage=True  + answer=pending    → pending
+      coverage=None  + answer=fail       → fail
+      coverage=None  + 其他              → pending
+      (无证据门槛 P0)                     → answer_correctness
     """
-    if human_review:
-        return "pending"
     if not has_evidence_gate:
         return final_ac
-    if final_ac == "pass" and cov_hit:
-        return "pass"
-    if final_ac == "fail" or not cov_hit:
+    if cov_hit is False:
+        return "fail"
+    if cov_hit is True:
+        if final_ac == "pass":
+            return "pass"
+        if final_ac == "fail":
+            return "fail"
+        return "pending"
+    # cov_hit is None（unknown，如 no_context）
+    if final_ac == "fail":
         return "fail"
     return "pending"
 
@@ -695,7 +738,9 @@ def merge_raw_judge_fields(old, mode, script_hash, temperature, max_tokens):
 
     - mode="judge"：追加当前脚本哈希与本次调用配置（去重）。
     - mode="rejudge"：保留旧 raw 历史；若从未记录则补 RAW_JUDGE_SCRIPT_HISTORY
-      （91447b21 主跑版与 6000 补跑版均未提交、不可从 git 回溯，如实标注）。
+      （91447b21 主跑版完整 SHA-256 + 6000 补跑版 hash_status=unrecoverable）。
+    - raw_judge_script_hashes 只含可校验的实际哈希（跳过 null/unrecoverable）。
+    - raw_generation_configs 保留完整条目（含 hash_status 字段）。
     返回 (raw_prompt_hash, raw_hashes, raw_configs)。
     """
     if mode == "judge":
@@ -704,8 +749,8 @@ def merge_raw_judge_fields(old, mode, script_hash, temperature, max_tokens):
             raw_hashes.append(script_hash)
         raw_configs = list(old.get("raw_generation_configs") or [])
         raw_configs.append({
-            "script_hash": script_hash, "temperature": temperature,
-            "max_tokens": max_tokens,
+            "script_hash": script_hash, "hash_status": "verified",
+            "temperature": temperature, "max_tokens": max_tokens,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "note": "judge 调用"})
         raw_prompt = old.get("raw_judge_prompt_hash") or judge_prompt_hash()
@@ -714,9 +759,11 @@ def merge_raw_judge_fields(old, mode, script_hash, temperature, max_tokens):
         raw_configs = old.get("raw_generation_configs")
         raw_prompt = old.get("raw_judge_prompt_hash")
         if not raw_hashes:
-            raw_hashes = [h["script_hash"] for h in RAW_JUDGE_SCRIPT_HISTORY]
+            # 只取有实际哈希的（跳过 null/unrecoverable）
+            raw_hashes = [h["script_hash"] for h in RAW_JUDGE_SCRIPT_HISTORY
+                          if h.get("script_hash")]
         if not raw_configs:
-            raw_configs = RAW_JUDGE_SCRIPT_HISTORY
+            raw_configs = [dict(h) for h in RAW_JUDGE_SCRIPT_HISTORY]
         if not raw_prompt:
             raw_prompt = judge_prompt_hash()
     return raw_prompt, raw_hashes, raw_configs
@@ -781,6 +828,7 @@ def build_summary(repeat, seed, snapshot):
     od = out_dir(repeat, seed, snapshot)
     questions = load_questions()
     evidence = load_evidence_spans()
+    evidence_reqs = load_evidence_requirements()
     summary = {"repeat": repeat, "seed": seed, "snapshot": snapshot}
     routes_sum = {}
     for route in ROUTES:
@@ -817,19 +865,21 @@ def build_summary(repeat, seed, snapshot):
             ac[final] += 1
             # source_evidence_coverage（仅 P1-P4 与 P_gold 有证据门槛；P0 无）
             if not has_gate:
-                rs[combine_route_success(final, False, False, hr)] += 1
+                # P0 无证据门槛：route_success = final_answer_correctness
+                rs[combine_route_success(final, None, False, hr)] += 1
                 continue
             ctx = contexts.get(r["question_id"])
             if ctx is None:
                 cov["no_context"] += 1
-                rs["pending"] += 1
+                # coverage=unknown(None)：answer=fail→fail，否则 pending
+                rs[combine_route_success(final, None, True, hr)] += 1
                 continue
-            required = {u["unit_id"] for u in questions[r["question_id"]]["answer_units"]
-                        if u["required"]}
+            ers = evidence_reqs.get(r["question_id"], [])
             # P1/P_gold 纯 source 全文即 Sources；P2-P4 只搜索 -----Sources----- 区段
-            _, cov_hit = calc_source_evidence_coverage(
-                ctx, evidence.get(r["question_id"], {}), required,
+            cov_result = calc_source_evidence_coverage(
+                ctx, ers, evidence.get(r["question_id"], {}),
                 search="sources" if route in ("P2", "P3", "P4") else "full")
+            cov_hit = cov_result["complete_evidence_hit"]
             cov["pass" if cov_hit else "fail"] += 1
             rs[combine_route_success(final, cov_hit, True, hr)] += 1
         routes_sum[route] = {
