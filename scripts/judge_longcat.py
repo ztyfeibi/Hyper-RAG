@@ -54,13 +54,32 @@ normalize_proxy_env()
 # ---------------------------------------------------------------------------
 # 版本 / 常量
 # ---------------------------------------------------------------------------
-JUDGE_VERSION = "v1.1.0"            # judge 实现版本（每次改 prompt/规则递增）
+JUDGE_VERSION = "v1.2.0"            # judge 实现版本（每次改 prompt/规则递增）
 JSON_SCHEMA_VERSION = "v1"          # 输出 JSON schema 版本
 # v2（2026-08-13）：unsupported_claims / critical_error 不再自动派生 fail，
 # 而是悬置为 uncertain 并进入人工复核（契约 §12.1 line 867：uncertain/unsupported/
 # critical/矛盾 一律进人工复核，不由规则直接判死）。prompt 未变 -> prompt hash 不变，
 # 已产出的 480 条原始 LLM 输出可直接离线重裁决（--mode rejudge），无需重新请求 LongCat。
 ADJUDICATION_RULE_VERSION = "v2"    # verdict 判定规则版本（冻结点之一）
+# v2（2026-08-13）：证据组覆盖判定。v1 = 全 context 子串搜索；
+# v2 = evidence requirement 组间 AND + alternative source 组内 OR，
+# 且 P2-P4 只搜索 -----Sources----- 区段（Entities/Relationships 区段不能贡献 source hit，
+# §8.3 line 528）。P1/P_gold 纯 source 文本无标记，全文即 Sources。非冻结项（审计字段）。
+COVERAGE_RULE_VERSION = "v2"
+
+# 原始 480 条 LLM 调用的脚本版本历史（r0_s42_5c92f17c，2026-08-12 晚 ~ 08-13 凌晨）。
+# judge_longcat.py 直到 8c67a0e 才首次提交，此前版本均不可从 git 回溯：
+# - 91447b21…a7f3f9d：主跑 480 条 + 首次补跑（MAX_TOKENS=3000），用户快照哈希
+# - max_tokens=6000 补跑版：39 条缺口/parse_fail 补跑（修复 JSON 截断），哈希不可回溯
+# 现文件（离线裁决器）哈希独立记录为 adjudicator_script_hash，不冒充原始调用环境。
+RAW_JUDGE_SCRIPT_HISTORY = [
+    {"script_hash": "91447b21…a7f3f9d（未提交，用户快照）",
+     "temperature": 0.0, "max_tokens": 3000,
+     "note": "主跑 480 条 + 首次补跑 85 条（部分被双进程踩踏后由用户重跑成功）"},
+    {"script_hash": "unrecoverable（未提交）",
+     "temperature": 0.0, "max_tokens": 6000,
+     "note": "39 条缺口/parse_fail 补跑（MAX_TOKENS 3000->6000 修复截断后）"},
+]
 RETRY_POLICY = {
     "json_parse_retry": 1,          # JSON 解析失败重试次数（契约：一次，针对解析层）
     "api_max_attempts": 5,          # API 调用最大尝试（基础设施层，不受契约"一次"限制）
@@ -228,18 +247,46 @@ def normalize_ws(s) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
 
 
-def calc_source_evidence_coverage(context, spans_by_unit, required_units):
-    """确定性、可审计、不调 LLM 的证据覆盖判定（§8.3 line 528：
-    图结构命中不能替代 source evidence 命中 —— 只认原文 quote 子串命中）。
+SOURCE_SECTION_MARK = "-----Sources-----"
 
-    对每个 required AU：其任一 evidence span 的 quote（空白归一化后）作为子串
-    出现在 final context 中 -> 该 AU 覆盖。返回 (per_au_hit, all_hit)。
+
+def extract_sources_section(context) -> str:
+    """返回 context 的 Sources 区段文本。
+
+    P2-P4 的组装 context 含 -----Entities-----/-----Relationships-----/-----Sources-----
+    区段（Sources 在最后）；P1/P_gold 是纯 source 文本、无区段标记。
+    契约（§8.3 line 528）：只有 Sources 区段可贡献 source evidence hit，
+    Entity/Relationship 区段（CSV 描述）不能。无标记时返回整个 context。
     """
-    ctx_n = normalize_ws(context)
+    c = context or ""
+    m = re.search(rf"^{re.escape(SOURCE_SECTION_MARK)}$", c, re.M)
+    if m:
+        return c[m.end():]
+    return c
+
+
+def calc_source_evidence_coverage(context, spans_by_unit, required_units, search="full"):
+    """确定性、可审计、不调 LLM 的证据组覆盖判定（§8.3 line 528 + coverage_rule_version=v2）。
+
+    - evidence requirement 组间 AND：每个 required AU（有 evidence_spans 的）都必须满足；
+      无 evidence_spans 的 required AU 视为未满足（严格：required AU 必须有证据）。
+    - alternative source 组内 OR：AU 的任一 evidence span quote（空白归一化后）作为子串
+      命中搜索文本即满足该组。
+    - search="full"（P1/P_gold）：整个 context 即 Sources；search="sources"（P2-P4）：
+      仅 -----Sources----- 区段（Entities/Relationships 区段不能贡献 source hit）。
+
+    返回 (per_au_hit, all_hit)。
+    """
+    ctx_n = normalize_ws(
+        extract_sources_section(context) if search == "sources" else context)
     per_au = {}
     for u in required_units:
+        spans = spans_by_unit.get(u) or []
+        if not spans:
+            per_au[u] = False
+            continue
         hit = False
-        for s in (spans_by_unit.get(u) or []):
+        for s in spans:
             q = normalize_ws(s.get("quote"))
             if q and q in ctx_n:
                 hit = True
@@ -247,6 +294,32 @@ def calc_source_evidence_coverage(context, spans_by_unit, required_units):
         per_au[u] = hit
     all_hit = bool(required_units) and all(per_au.values())
     return per_au, all_hit
+
+
+def final_answer_correctness(derived, human_review):
+    """契约组合：human_review=true 的记录 final 一律 pending（§12.1 line 867：
+    矛盾/critical/unsupported/uncertain 均需人工复核，不由规则判死）。
+    pre_review 判定（derived）保留为审计字段。uncertain 兜底归 pending。"""
+    if human_review:
+        return "pending"
+    return derived if derived in ("pass", "fail") else "pending"
+
+
+def combine_route_success(final_ac, cov_hit, has_evidence_gate, human_review):
+    """route_success 三层组合（§8.3 line 518-520）：
+    - human_review=true -> pending（等人工裁决，不因 cov 提前判死）
+    - P0 无证据门槛：route_success = final_answer_correctness
+    - P1-P4/P_gold 双门槛：final_ac=pass AND cov_hit -> pass；否则 fail/pending
+    """
+    if human_review:
+        return "pending"
+    if not has_evidence_gate:
+        return final_ac
+    if final_ac == "pass" and cov_hit:
+        return "pass"
+    if final_ac == "fail" or not cov_hit:
+        return "fail"
+    return "pending"
 
 
 def load_result_contexts(path: Path) -> dict:
@@ -612,16 +685,62 @@ def rejudge_records(repeat, seed, snapshot, routes):
         for r in hr_rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
     print(f"[rejudge] human_review.jsonl 重建完成: {len(hr_rows)} 条")
-    write_manifest(repeat, seed, snapshot, routes)
-    print(f"[rejudge] 完成，共重裁决 {total} 条；manifest 已更新 rule_version=v2")
+    write_manifest(repeat, seed, snapshot, routes, mode="rejudge")
+    print(f"[rejudge] 完成，共重裁决 {total} 条；manifest 已更新 rule_version=v2，"
+          f"raw 部分保留原始 480 次调用环境")
 
 
-def write_manifest(repeat, seed, snapshot, routes):
+def merge_raw_judge_fields(old, mode, script_hash, temperature, max_tokens):
+    """合并 manifest 的 raw_judge_* 字段（原始 480 次 API 调用环境，与裁决器分离）。
+
+    - mode="judge"：追加当前脚本哈希与本次调用配置（去重）。
+    - mode="rejudge"：保留旧 raw 历史；若从未记录则补 RAW_JUDGE_SCRIPT_HISTORY
+      （91447b21 主跑版与 6000 补跑版均未提交、不可从 git 回溯，如实标注）。
+    返回 (raw_prompt_hash, raw_hashes, raw_configs)。
+    """
+    if mode == "judge":
+        raw_hashes = list(old.get("raw_judge_script_hashes") or [])
+        if script_hash not in raw_hashes:
+            raw_hashes.append(script_hash)
+        raw_configs = list(old.get("raw_generation_configs") or [])
+        raw_configs.append({
+            "script_hash": script_hash, "temperature": temperature,
+            "max_tokens": max_tokens,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "note": "judge 调用"})
+        raw_prompt = old.get("raw_judge_prompt_hash") or judge_prompt_hash()
+    else:  # rejudge：不追加，保留历史；无历史则补已知记录
+        raw_hashes = old.get("raw_judge_script_hashes")
+        raw_configs = old.get("raw_generation_configs")
+        raw_prompt = old.get("raw_judge_prompt_hash")
+        if not raw_hashes:
+            raw_hashes = [h["script_hash"] for h in RAW_JUDGE_SCRIPT_HISTORY]
+        if not raw_configs:
+            raw_configs = RAW_JUDGE_SCRIPT_HISTORY
+        if not raw_prompt:
+            raw_prompt = judge_prompt_hash()
+    return raw_prompt, raw_hashes, raw_configs
+
+
+def write_manifest(repeat, seed, snapshot, routes, mode="judge", concurrency=None):
     od = out_dir(repeat, seed, snapshot)
     result_hashes = {}
     for route in routes:
         rf = result_file(route, repeat, seed, snapshot)
         result_hashes[route] = (sha256_file(rf) if rf.exists() else None)
+    script_hash = sha256_file(Path(__file__).resolve())
+    # 保留旧 manifest（raw 部分跨 judge/rejudge 运行继承，不互相覆盖）
+    old = {}
+    mp = od / "manifest.json"
+    if mp.exists():
+        try:
+            old = json.loads(mp.read_text(encoding="utf-8"))
+        except Exception:
+            old = {}
+    raw_prompt, raw_hashes, raw_configs = merge_raw_judge_fields(
+        old, mode, script_hash, TEMPERATURE, MAX_TOKENS)
+    if mode == "judge" and concurrency is not None and raw_configs:
+        raw_configs[-1]["concurrency"] = concurrency
     manifest = {
         "judge_model": LLM_MODEL_SILICONFLOW,
         "service": LLM_BASE_URL_SILICONFLOW,
@@ -631,9 +750,15 @@ def write_manifest(repeat, seed, snapshot, routes):
         "judge_prompt_hash": judge_prompt_hash(),
         "json_schema_version": JSON_SCHEMA_VERSION,
         "adjudication_rule_version": ADJUDICATION_RULE_VERSION,
+        "coverage_rule_version": COVERAGE_RULE_VERSION,
         "retry_policy": RETRY_POLICY,
         "judge_script": str(Path(__file__).resolve()),
-        "judge_script_hash": sha256_file(Path(__file__).resolve()),
+        # ---- 原始 480 次 API 调用环境（不随裁决器修改而变）----
+        "raw_judge_prompt_hash": raw_prompt,
+        "raw_judge_script_hashes": raw_hashes,
+        "raw_generation_configs": raw_configs,
+        # ---- 离线裁决器（现文件，独立哈希）----
+        "adjudicator_script_hash": script_hash,
         "qrels_version": "questions_v2_manual_final+verified_evidence",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "repeat": repeat,
@@ -673,46 +798,46 @@ def build_summary(repeat, seed, snapshot):
         parsed = [r for r in rows if r.get("parse_ok")]
         vc = {}
         ac = {"pass": 0, "fail": 0, "pending": 0}
+        ac_pre = {"pass": 0, "fail": 0, "pending": 0}
         cov = {"pass": 0, "fail": 0, "no_context": 0}
         rs = {"pass": 0, "fail": 0, "pending": 0}
         rf = result_file(route, repeat, seed, snapshot)
         contexts = load_result_contexts(rf) if rf.exists() else {}
+        has_gate = route != "P0"
         for r in parsed:
             v = r["verdict"]
             vc[v] = vc.get(v, 0) + 1
             # answer_correctness（§8.3：最终回答必须覆盖所有必要答案点，不得冲突）
+            # 契约 §12.1：human_review=true -> final=pending（矛盾/critical/unsupported/
+            # uncertain 均需人工复核，不由规则判死）；pre_review 判定保留为审计。
             d = r.get("derived_verdict")
-            if d == "pass":
-                ac["pass"] += 1
-            elif d == "fail":
-                ac["fail"] += 1
-            else:
-                ac["pending"] += 1
+            hr = bool(r.get("human_review"))
+            ac_pre["pass" if d == "pass" else ("fail" if d == "fail" else "pending")] += 1
+            final = final_answer_correctness(d, hr)
+            ac[final] += 1
             # source_evidence_coverage（仅 P1-P4 与 P_gold 有证据门槛；P0 无）
-            ctx = contexts.get(r["question_id"])
-            if route == "P0":
-                rs["pass" if d == "pass" else ("fail" if d == "fail" else "pending")] += 1
+            if not has_gate:
+                rs[combine_route_success(final, False, False, hr)] += 1
                 continue
+            ctx = contexts.get(r["question_id"])
             if ctx is None:
                 cov["no_context"] += 1
                 rs["pending"] += 1
                 continue
             required = {u["unit_id"] for u in questions[r["question_id"]]["answer_units"]
                         if u["required"]}
+            # P1/P_gold 纯 source 全文即 Sources；P2-P4 只搜索 -----Sources----- 区段
             _, cov_hit = calc_source_evidence_coverage(
-                ctx, evidence.get(r["question_id"], {}), required)
+                ctx, evidence.get(r["question_id"], {}), required,
+                search="sources" if route in ("P2", "P3", "P4") else "full")
             cov["pass" if cov_hit else "fail"] += 1
-            if d == "pass" and cov_hit:
-                rs["pass"] += 1
-            elif d == "fail" or not cov_hit:
-                rs["fail"] += 1
-            else:
-                rs["pending"] += 1
+            rs[combine_route_success(final, cov_hit, True, hr)] += 1
         routes_sum[route] = {
             "n_total": len(rows), "n_parsed": len(parsed),
             "parse_rate": round(len(parsed) / len(rows), 4) if rows else 0.0,
             "verdicts": vc,
             "answer_correctness": ac,
+            "answer_correctness_pre_review": ac_pre,
             "source_evidence_coverage": cov,
             "route_success": rs,
             "n_human_review": sum(1 for r in rows if r.get("human_review")),
@@ -741,7 +866,8 @@ def main():
     if args.mode == "judge":
         run_judge(args.routes, args.repeat, args.seed, args.snapshot,
                   args.smoke, args.concurrency)
-        write_manifest(args.repeat, args.seed, args.snapshot, args.routes)
+        write_manifest(args.repeat, args.seed, args.snapshot, args.routes,
+                       mode="judge", concurrency=args.concurrency)
     elif args.mode == "rejudge":
         rejudge_records(args.repeat, args.seed, args.snapshot, args.routes)
     elif args.mode == "summary":
