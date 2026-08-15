@@ -64,18 +64,21 @@ SET_OUTPUT = {"D": SUP_DIR / "verdicts_ai_supplementary_D.jsonl",
 
 OUTPUT_INSTRUCTION = """\
 请对上面材料给出 JSON 判定（只输出 JSON，不输出其他文字）：
-{
-  "review_id": "<材料编号，原样返回>",
-  "au_status": {"AU1": "supported|missing|contradicted", ...},
+{{
+  "review_id": "{rid}",
+  "au_status": {{"AU1": "supported|missing|contradicted", ...}},
   "verdict": "pass|fail|uncertain",
   "unsupported_fatality": "none|harmless|fatal|unresolved",
-  "unsupported_claims": [{"claim": "<原文陈述>", "status": "supported_by_source|unsupported_noncritical|contradicted|unverifiable"}, ...],
+  "claim_status_by_id": {{"{c1}": "supported_by_source|unsupported_noncritical|contradicted|unverifiable", ...}},
+  "additional_claims": [{{"claim": "<候选答案中其他超出证据的陈述原文>", "status": "supported_by_source|unsupported_noncritical|contradicted|unverifiable"}}, ...],
   "notes": "<可选备注，无则空字符串>"
-}
+}}
 要求：
-- au_status 必须覆盖材料中列出的**全部** Answer units（含 optional）。
-- 材料中预列的每条"待判 claims"必须在 unsupported_claims 中出现（claim 文本原样保留），可补充候选答案中其他超出证据的陈述。
-- 若候选答案没有超出证据的陈述，unsupported_claims 为空列表，unsupported_fatality 为 none。
+- au_status 必须覆盖材料中列出的**全部** Answer units（含 optional），键用 AU 编号。
+- claim_status_by_id 的键用上面"预填待判 claims"给出的编号（{c1}、{c2}…），**每个编号都必须出现**，
+  取值只能是四种 status 之一；不要改写 claim 文本，脚本会按编号自动对应原文。
+- 若发现候选答案中还有超出证据的其他陈述，放进 additional_claims（文本尽量原样摘录）。
+- 若候选答案没有超出证据的陈述，additional_claims 为空列表，unsupported_fatality 为 none。
 - 证据不足判 uncertain，不得强行改成 fail。"""
 
 
@@ -167,8 +170,13 @@ def llm_call(prompt: str, system_prompt: str) -> str:
 # 输出校验
 # ---------------------------------------------------------------------------
 
-def validate_record(rec: dict, template: dict, au_ids: list) -> list:
-    """返回错误列表；空列表 = 合法。"""
+def validate_record(rec: dict, template: dict, au_ids: list,
+                    claim_ids: list) -> list:
+    """返回错误列表；空列表 = 合法。
+
+    预填 claims 按 claim_id（C1..Cn）回填校验，不要求模型抄写原文；
+    归一化由 normalize_record 完成。
+    """
     errs = []
     if rec.get("review_id") != template["review_id"]:
         errs.append(f"review_id 不匹配: {rec.get('review_id')!r} != {template['review_id']!r}")
@@ -190,21 +198,57 @@ def validate_record(rec: dict, template: dict, au_ids: list) -> list:
         errs.append(f"verdict 非法: {rec.get('verdict')!r}")
     if rec.get("unsupported_fatality") not in FATALITY_OPTIONS:
         errs.append(f"unsupported_fatality 非法: {rec.get('unsupported_fatality')!r}")
-    claims = rec.get("unsupported_claims")
-    if not isinstance(claims, list):
-        errs.append("unsupported_claims 不是列表")
+    by_id = rec.get("claim_status_by_id")
+    if not isinstance(by_id, dict):
+        errs.append("claim_status_by_id 不是对象")
     else:
-        for c in claims:
+        missing_ids = [c for c in claim_ids if c not in by_id]
+        extra_ids = [c for c in by_id if c not in claim_ids]
+        bad_status = [f"{k}={v}" for k, v in by_id.items()
+                      if v not in CLAIM_STATUS_OPTIONS]
+        if missing_ids:
+            errs.append(f"claim_status_by_id 缺编号: {missing_ids}")
+        if extra_ids:
+            errs.append(f"claim_status_by_id 多出编号: {extra_ids}")
+        if bad_status:
+            errs.append(f"claim status 非法: {bad_status}")
+    adds = rec.get("additional_claims", [])
+    if not isinstance(adds, list):
+        errs.append("additional_claims 不是列表")
+    else:
+        for c in adds:
             if not isinstance(c, dict) or not c.get("claim"):
-                errs.append(f"claim 结构非法: {c!r}")
+                errs.append(f"additional_claim 结构非法: {c!r}")
             elif c.get("status") not in CLAIM_STATUS_OPTIONS:
-                errs.append(f"claim status 非法: {c.get('status')!r}")
-        # 预填 claims 必须逐条出现（claim 文本精确匹配）
-        returned = {c.get("claim") for c in claims if isinstance(c, dict)}
-        for pc in template.get("unsupported_claims") or []:
-            if pc["claim"] not in returned:
-                errs.append(f"预填 claim 未返回: {pc['claim'][:60]}…")
+                errs.append(f"additional_claim status 非法: {c.get('status')!r}")
     return errs
+
+
+def normalize_record(rec: dict, template: dict) -> dict:
+    """按编号把预填 claim 原文与模型 status 合并成统一的 unsupported_claims。
+
+    输出记录结构与旧格式（unsupported_claims 列表）完全兼容，Step 3 合并无感知。
+    """
+    prefilled = template.get("unsupported_claims") or []
+    by_id = rec.get("claim_status_by_id") or {}
+    claims = []
+    for i, pc in enumerate(prefilled, 1):
+        cid = f"C{i}"
+        claims.append({"claim": pc["claim"], "status": by_id[cid],
+                       "claim_id": cid, "prefilled": True})
+    for c in rec.get("additional_claims") or []:
+        claims.append({"claim": c["claim"], "status": c["status"],
+                       "claim_id": None, "prefilled": False})
+    out = {
+        "review_id": rec["review_id"],
+        "au_status": rec["au_status"],
+        "verdict": rec["verdict"],
+        "unsupported_fatality": rec["unsupported_fatality"],
+        "unsupported_claims": claims,
+        "notes": rec.get("notes", ""),
+        "response_schema": "claim_id_v2",
+    }
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +282,14 @@ def run_set(set_name: str, limit=None, parse_retry=DEFAULT_PARSE_RETRY,
             rid = tpl["review_id"]
             section = sections[rid]
             au_ids = extract_au_ids(section)
-            prompt = f"{section}\n\n---\n\n{OUTPUT_INSTRUCTION}"
+            prefilled = tpl.get("unsupported_claims") or []
+            claim_ids = [f"C{k}" for k in range(1, len(prefilled) + 1)]
+            lines = [f"{section}\n\n---\n\n预填待判 claims（编号供回填，status 必须逐条给出）："]
+            for k, pc in enumerate(prefilled, 1):
+                lines.append(f"C{k}: {pc['claim']}")
+            prompt = "\n".join(lines) + "\n\n---\n\n" + OUTPUT_INSTRUCTION.format(
+                rid=rid, c1=claim_ids[0] if claim_ids else "C1",
+                c2=claim_ids[1] if len(claim_ids) > 1 else "C2")
 
             rec, errs = None, []
             for attempt in range(1, parse_retry + 1):
@@ -250,17 +301,15 @@ def run_set(set_name: str, limit=None, parse_retry=DEFAULT_PARSE_RETRY,
                     errs = [f"JSON 解析失败: {e}"]
                     cand = None
                 if cand is not None:
-                    errs = validate_record(cand, tpl, au_ids)
+                    errs = validate_record(cand, tpl, au_ids, claim_ids)
                     if not errs:
-                        rec = cand
+                        rec = normalize_record(cand, tpl)
                         break
                 stats["parse_retries"] += 1
                 print(f"  [{rid}] 尝试 {attempt} 不合格: {errs[:2]}", flush=True)
             if rec is None:
                 raise SystemExit(f"[{rid}] {parse_retry} 次尝试后仍不合格: {errs}")
 
-            if "notes" not in rec:
-                rec["notes"] = ""
             fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
             fout.flush()
             stats["done"] += 1
@@ -272,10 +321,12 @@ def run_set(set_name: str, limit=None, parse_retry=DEFAULT_PARSE_RETRY,
 
 
 def write_metadata(all_stats: dict, args) -> Path:
+    provider = ("SiliconFlow" if "siliconflow" in LLM_BASE_URL_SILICONFLOW
+                else "local-vllm")
     meta = {
         "annotation_type": "supplementary_ai_review",
         "review_model": LLM_MODEL_SILICONFLOW,
-        "review_provider": "SiliconFlow",
+        "review_provider": provider,
         "review_base_url": LLM_BASE_URL_SILICONFLOW,
         "review_temperature": TEMPERATURE,
         "review_max_tokens": MAX_TOKENS,

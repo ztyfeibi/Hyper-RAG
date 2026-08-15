@@ -62,15 +62,73 @@ class TestMaterialParsing:
 # ---------------------------------------------------------------------------
 
 def _valid_record(tpl, au_ids):
+    prefilled = tpl["unsupported_claims"]
     return {
         "review_id": tpl["review_id"],
         "au_status": {a: "supported" for a in au_ids},
         "verdict": "pass",
         "unsupported_fatality": "none",
-        "unsupported_claims": [{"claim": c["claim"], "status": "unverifiable"}
-                               for c in tpl["unsupported_claims"]],
+        "claim_status_by_id": {f"C{i}": "unverifiable"
+                               for i in range(1, len(prefilled) + 1)},
+        "additional_claims": [],
         "notes": "",
     }
+
+
+def _cids(tpl):
+    return [f"C{i}" for i in range(1, len(tpl["unsupported_claims"]) + 1)]
+
+
+class TestNormalizeRecord:
+    def test_normalize_maps_ids_to_original_text(self, materials):
+        tpl = next(t for t in materials["d_tpl"] if t["unsupported_claims"])
+        au = rsr.extract_au_ids(materials["d_sections"][tpl["review_id"]])
+        raw = _valid_record(tpl, au)
+        raw["claim_status_by_id"]["C1"] = "contradicted"
+        raw["additional_claims"] = [{"claim": "extra stmt", "status": "unverifiable"}]
+        out = rsr.normalize_record(raw, tpl)
+        claims = out["unsupported_claims"]
+        assert claims[0]["claim"] == tpl["unsupported_claims"][0]["claim"]
+        assert claims[0]["status"] == "contradicted"
+        assert claims[0]["claim_id"] == "C1" and claims[0]["prefilled"] is True
+        assert claims[-1] == {"claim": "extra stmt", "status": "unverifiable",
+                              "claim_id": None, "prefilled": False}
+        assert out["response_schema"] == "claim_id_v2"
+        assert out["review_id"] == tpl["review_id"]
+
+    def test_normalize_zero_claims(self, materials):
+        tpl = next(t for t in materials["d_tpl"] if not t["unsupported_claims"])
+        au = rsr.extract_au_ids(materials["d_sections"][tpl["review_id"]])
+        out = rsr.normalize_record(_valid_record(tpl, au), tpl)
+        assert out["unsupported_claims"] == []
+
+
+def _cids(tpl):
+    return [f"C{i}" for i in range(1, len(tpl["unsupported_claims"]) + 1)]
+
+
+class TestNormalizeRecord:
+    def test_normalize_maps_ids_to_original_text(self, materials):
+        tpl = next(t for t in materials["d_tpl"] if t["unsupported_claims"])
+        au = rsr.extract_au_ids(materials["d_sections"][tpl["review_id"]])
+        raw = _valid_record(tpl, au)
+        raw["claim_status_by_id"]["C1"] = "contradicted"
+        raw["additional_claims"] = [{"claim": "extra stmt", "status": "unverifiable"}]
+        out = rsr.normalize_record(raw, tpl)
+        claims = out["unsupported_claims"]
+        assert claims[0]["claim"] == tpl["unsupported_claims"][0]["claim"]
+        assert claims[0]["status"] == "contradicted"
+        assert claims[0]["claim_id"] == "C1" and claims[0]["prefilled"] is True
+        assert claims[-1] == {"claim": "extra stmt", "status": "unverifiable",
+                              "claim_id": None, "prefilled": False}
+        assert out["response_schema"] == "claim_id_v2"
+        assert out["review_id"] == tpl["review_id"]
+
+    def test_normalize_zero_claims(self, materials):
+        tpl = next(t for t in materials["d_tpl"] if not t["unsupported_claims"])
+        au = rsr.extract_au_ids(materials["d_sections"][tpl["review_id"]])
+        out = rsr.normalize_record(_valid_record(tpl, au), tpl)
+        assert out["unsupported_claims"] == []
 
 
 class TestValidateRecord:
@@ -78,14 +136,14 @@ class TestValidateRecord:
         tpl = materials["d_tpl"][0]
         sec = materials["d_sections"][tpl["review_id"]]
         au = rsr.extract_au_ids(sec)
-        assert rsr.validate_record(_valid_record(tpl, au), tpl, au) == []
+        assert rsr.validate_record(_valid_record(tpl, au), tpl, au, _cids(tpl)) == []
 
     def test_review_id_mismatch(self, materials):
         tpl = materials["d_tpl"][0]
         au = rsr.extract_au_ids(materials["d_sections"][tpl["review_id"]])
         rec = _valid_record(tpl, au)
         rec["review_id"] = "SR-D-999"
-        errs = rsr.validate_record(rec, tpl, au)
+        errs = rsr.validate_record(rec, tpl, au, _cids(tpl))
         assert any("review_id" in e for e in errs)
 
     def test_missing_au_rejected(self, materials):
@@ -93,7 +151,7 @@ class TestValidateRecord:
         au = rsr.extract_au_ids(materials["d_sections"][tpl["review_id"]])
         rec = _valid_record(tpl, au)
         rec["au_status"].pop(au[0])
-        errs = rsr.validate_record(rec, tpl, au)
+        errs = rsr.validate_record(rec, tpl, au, _cids(tpl))
         assert any("缺 AU" in e for e in errs)
 
     def test_bad_verdict_rejected(self, materials):
@@ -101,15 +159,31 @@ class TestValidateRecord:
         au = rsr.extract_au_ids(materials["d_sections"][tpl["review_id"]])
         rec = _valid_record(tpl, au)
         rec["verdict"] = "maybe"
-        assert rsr.validate_record(rec, tpl, au)
+        assert rsr.validate_record(rec, tpl, au, _cids(tpl))
 
-    def test_missing_prefilled_claim_rejected(self, materials):
+    def test_missing_prefilled_claim_id_rejected(self, materials):
         tpl = next(t for t in materials["d_tpl"] if t["unsupported_claims"])
         au = rsr.extract_au_ids(materials["d_sections"][tpl["review_id"]])
         rec = _valid_record(tpl, au)
-        rec["unsupported_claims"] = rec["unsupported_claims"][1:]
-        errs = rsr.validate_record(rec, tpl, au)
-        assert any("预填 claim 未返回" in e for e in errs)
+        rec["claim_status_by_id"].pop("C1")
+        errs = rsr.validate_record(rec, tpl, au, _cids(tpl))
+        assert any("claim_status_by_id 缺编号" in e for e in errs)
+
+    def test_bad_claim_status_rejected(self, materials):
+        tpl = next(t for t in materials["d_tpl"] if len(t["unsupported_claims"]) >= 2)
+        au = rsr.extract_au_ids(materials["d_sections"][tpl["review_id"]])
+        rec = _valid_record(tpl, au)
+        rec["claim_status_by_id"]["C2"] = "supported"
+        errs = rsr.validate_record(rec, tpl, au, _cids(tpl))
+        assert any("claim status 非法" in e for e in errs)
+
+    def test_no_echo_of_claim_text_required(self, materials):
+        """回归锁定：claim_id schema 下模型无需抄写 claim 原文也合法。"""
+        tpl = next(t for t in materials["d_tpl"] if t["unsupported_claims"])
+        au = rsr.extract_au_ids(materials["d_sections"][tpl["review_id"]])
+        rec = _valid_record(tpl, au)
+        rec.pop("unsupported_claims", None)  # 原始响应里根本没有该字段
+        assert rsr.validate_record(rec, tpl, au, _cids(tpl)) == []
 
     def test_unresolved_fatality_accepted(self, materials):
         """契约允许 unresolved fatality（Step 2 规格四值）。"""
@@ -117,7 +191,7 @@ class TestValidateRecord:
         au = rsr.extract_au_ids(materials["e_sections"][tpl["review_id"]])
         rec = _valid_record(tpl, au)
         rec["unsupported_fatality"] = "unresolved"
-        assert rsr.validate_record(rec, tpl, au) == []
+        assert rsr.validate_record(rec, tpl, au, _cids(tpl)) == []
 
 
 # ---------------------------------------------------------------------------
@@ -202,9 +276,11 @@ class TestMetadata:
             parse_retry = 3
         meta_path = rsr.write_metadata({"D": {"done": 3}, "E": {"done": 1}}, A())
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        assert meta["review_model"].endswith("LongCat-2.0")
+        assert meta["review_model"]  # 当前配置 qwen-27b-int4（本地）
         assert meta["review_temperature"] == 0.0
-        assert meta["review_provider"] == "SiliconFlow"
+        assert meta["review_provider"] in ("SiliconFlow", "local-vllm")
+        assert "siliconflow" in rsr.LLM_BASE_URL_SILICONFLOW or \
+            meta["review_provider"] == "local-vllm"
         assert len(meta["prompt_guide_sha256"]) == 64
         assert set(meta["material_md_sha256"]) == {"D", "E"}
         assert set(meta["template_sha256"]) == {"D", "E"}
