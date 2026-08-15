@@ -77,8 +77,11 @@ OUTPUT_INSTRUCTION = """\
 - au_status 必须覆盖材料中列出的**全部** Answer units（含 optional），键用 AU 编号。
 - claim_status_by_id 的键用上面"预填待判 claims"给出的编号（{c1}、{c2}…），**每个编号都必须出现**，
   取值只能是四种 status 之一；不要改写 claim 文本，脚本会按编号自动对应原文。
-- 若发现候选答案中还有超出证据的其他陈述，放进 additional_claims（文本尽量原样摘录）。
-- 若候选答案没有超出证据的陈述，additional_claims 为空列表，unsupported_fatality 为 none。
+- 若发现候选答案中还有超出证据的其他陈述，放进 additional_claims，**最多 8 条**：
+  只挑最核心/最可能致命的陈述，每条一句话概括（不必逐字摘录）；超出 8 条时合并同类后再列出。
+- notes 必须不超过 200 个字符，只写结论性备注（如"证据仅覆盖机制，未覆盖治疗"），
+  **禁止写入推理过程或反复讨论**，无备注则给空字符串。
+- 输出总长度必须收敛：整个 JSON 不要超过 120 行。
 - 证据不足判 uncertain，不得强行改成 fail。"""
 
 
@@ -154,8 +157,17 @@ def llm_call(prompt: str, system_prompt: str) -> str:
                 temperature=TEMPERATURE,
                 max_tokens=MAX_TOKENS,
                 response_format={"type": "json_object"},
+                # qwen-27b @ vLLM：必须用 chat_template_kwargs 关 thinking，
+                # 否则思考内容会泄漏进 content（曾导致 notes 无限复读打满 max_tokens）
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
-            content = (resp.choices[0].message.content or "").strip()
+            choice = resp.choices[0]
+            if choice.finish_reason == "length":
+                # 明确暴露截断根因，而不是让下游报难以定位的 JSON 解析错误
+                raise RuntimeError(
+                    f"输出被 max_tokens={MAX_TOKENS} 截断 (finish_reason=length)，"
+                    f"completion_tokens={getattr(resp.usage, 'completion_tokens', '?')}")
+            content = (choice.message.content or "").strip()
             if not content:
                 raise RuntimeError(f"空响应 (attempt {attempt})")
             return content
@@ -330,6 +342,7 @@ def write_metadata(all_stats: dict, args) -> Path:
         "review_base_url": LLM_BASE_URL_SILICONFLOW,
         "review_temperature": TEMPERATURE,
         "review_max_tokens": MAX_TOKENS,
+        "review_disable_thinking": True,
         "parse_retry": args.parse_retry,
         "sets_run": args.set,
         "limit": args.limit,
