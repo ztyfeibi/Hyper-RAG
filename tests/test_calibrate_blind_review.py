@@ -19,9 +19,12 @@ sys.path.insert(0, str(_ROOT / "scripts"))
 import calibrate_blind_review as cal  # noqa: E402
 
 # 端到端运行 CLI 等价的 args（审核元数据不可证明 -> 全部 unknown）
+# 输出到测试专用目录，禁止触碰真实 ai_adjudication_v1（历史产物不可覆盖）
+_TEST_VERSION = "ai_adjudication_v1_testregen"
 ARGS_UNKNOWN = argparse.Namespace(
     review_model=None, review_provider=None, review_temperature=None,
-    review_prompt_path=None, annotation_type=None)
+    review_prompt_path=None, annotation_type=None,
+    output_version=_TEST_VERSION, overwrite=True)
 
 # 原始文件哈希（模块导入时采集，早于任何 fixture / apply 运行）
 _ORIG_FILES = (
@@ -69,7 +72,7 @@ def v2_ready():
 def applied(v2_ready):
     rc = cal.cmd_apply(ARGS_UNKNOWN)
     assert rc == 0, "cmd_apply 应成功（fail-closed 未触发）"
-    return cal._JUDGE_DIR / "ai_adjudication_v1"
+    return cal._JUDGE_DIR / _TEST_VERSION
 
 
 # ---------------------------------------------------------------------------
@@ -584,3 +587,21 @@ def test_validate_real_data(v2_ready):
     assert result["stats"]["set_A"] == 100
     assert result["stats"]["set_B"] == 43
     assert result["stats"]["set_C"] == 20
+
+
+def test_apply_refuses_to_overwrite_real_v1(v2_ready):
+    """旧模式默认 output_version=ai_adjudication_v1 且目录已存在时必须拒绝（防 2026-08-16 重写事故复发）。"""
+    args = argparse.Namespace(
+        review_model=None, review_provider=None, review_temperature=None,
+        review_prompt_path=None, annotation_type=None)  # 无 output_version -> 默认 v1
+    rc = cal.cmd_apply(args)
+    assert rc == 1, "ai_adjudication_v1 已存在且未加 --overwrite，必须返回 1"
+
+
+def test_apply_refuses_to_overwrite_real_v1(v2_ready):
+    """旧模式默认 output_version=ai_adjudication_v1 且目录已存在时必须拒绝（防 2026-08-16 重写事故复发）。"""
+    args = argparse.Namespace(
+        review_model=None, review_provider=None, review_temperature=None,
+        review_prompt_path=None, annotation_type=None)  # 无 output_version -> 默认 v1
+    rc = cal.cmd_apply(args)
+    assert rc == 1, "ai_adjudication_v1 已存在且未加 --overwrite，必须返回 1"

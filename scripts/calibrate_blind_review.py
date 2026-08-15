@@ -1192,14 +1192,15 @@ def cmd_apply(args) -> int:
     out_version_name = output_version or "ai_adjudication_v1"
     out_dir = _JUDGE_DIR / out_version_name
 
+    if out_dir.exists() and not overwrite:
+        print(f"ERROR: 输出目录已存在: {out_dir}（禁止静默覆盖；"
+              f"确认放弃旧产物后加 --overwrite）", file=sys.stderr)
+        return 1
+
     if merged_mode:
         ann_path = Path(annotation_file).resolve()
         if not ann_path.exists():
             print(f"ERROR: 标注文件不存在: {ann_path}", file=sys.stderr)
-            return 1
-        if out_dir.exists() and not overwrite:
-            print(f"ERROR: 输出目录已存在: {out_dir}（禁止静默覆盖；"
-                  f"确认放弃旧产物后加 --overwrite）", file=sys.stderr)
             return 1
         if out_version_name == "ai_adjudication_v1":
             print("ERROR: --annotation-file 模式禁止写入 ai_adjudication_v1"
