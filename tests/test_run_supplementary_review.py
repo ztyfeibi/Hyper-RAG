@@ -286,3 +286,73 @@ class TestMetadata:
         assert set(meta["template_sha256"]) == {"D", "E"}
         assert len(meta["script_sha256"]) == 64
         assert meta["stats"] == {"D": {"done": 3}, "E": {"done": 1}}
+
+
+class TestRebuildMetadata:
+    """--rebuild-metadata：离线重建，stats 以输出文件累计数为准。"""
+
+    def _setup_fake_sup(self, tmp_path, monkeypatch, n_d=155, n_e=12, dup=False):
+        sup = tmp_path / "sup"
+        sup.mkdir(exist_ok=True)
+        (sup / "REVIEW_GUIDE.md").write_text("guide", encoding="utf-8")
+        set_md, set_tpl, set_out = {}, {}, {}
+        for s, n, prefix in (("D", n_d, "SR-D"), ("E", n_e, "SR-E")):
+            (sup / f"md_{s}.md").write_text("### material", encoding="utf-8")
+            (sup / f"tpl_{s}.jsonl").write_text("\n".join(
+                json.dumps({"review_id": f"{prefix}-{i:03d}"})
+                for i in range(1, n + 1)) + "\n", encoding="utf-8")
+            rows = [{"review_id": f"{prefix}-{i:03d}",
+                     "response_schema": "claim_id_v2" if i > 2 else "legacy"}
+                    for i in range(1, n + 1)]
+            if dup:
+                rows.append(dict(rows[0]))  # 制造重复 review_id
+            (sup / f"out_{s}.jsonl").write_text(
+                "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+            set_md[s] = sup / f"md_{s}.md"
+            set_tpl[s] = sup / f"tpl_{s}.jsonl"
+            set_out[s] = sup / f"out_{s}.jsonl"
+        monkeypatch.setattr(rsr, "SUP_DIR", sup)
+        monkeypatch.setattr(rsr, "SET_MD", set_md)
+        monkeypatch.setattr(rsr, "SET_TEMPLATE", set_tpl)
+        monkeypatch.setattr(rsr, "SET_OUTPUT", set_out)
+        return sup
+
+    def test_rebuild_stats_and_sha(self, tmp_path, monkeypatch):
+        sup = self._setup_fake_sup(tmp_path, monkeypatch)
+        meta_path = rsr.rebuild_metadata()
+        assert meta_path == sup / "review_metadata.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        assert meta["stats"]["D"]["done"] == 155
+        assert meta["stats"]["E"]["done"] == 12
+        assert meta["stats"]["D"]["todo"] == 0
+        assert meta["stats"]["E"]["todo"] == 0
+        # 本次新增/跳过恒为 0（离线重建不调模型）
+        assert meta["stats"]["D"]["new_this_run"] == 0
+        assert meta["stats"]["D"]["skipped_this_run"] == 0
+        # schema 分布：前 2 条 legacy，其余 claim_id_v2
+        assert meta["stats"]["D"]["response_schema_dist"] == {
+            "legacy": 2, "claim_id_v2": 153}
+        # 输出 JSONL SHA-256
+        for s in ("D", "E"):
+            info = meta["output_files"][s]
+            assert info["n"] in (155, 12)
+            assert len(info["sha256"]) == 64
+            import hashlib
+            assert info["sha256"] == hashlib.sha256(
+                rsr.SET_OUTPUT[s].read_bytes()).hexdigest()
+        assert meta["rebuilt_offline"] is True
+
+    def test_rebuild_real_outputs(self):
+        """真实产物离线重建：D=155 / E=12，todo=0。"""
+        meta_path = rsr.rebuild_metadata()
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        assert meta["stats"]["D"]["done"] == 155
+        assert meta["stats"]["E"]["done"] == 12
+        assert meta["stats"]["D"]["todo"] == 0
+        assert meta["stats"]["E"]["todo"] == 0
+        assert meta["stats"]["D"]["response_schema_dist"]["claim_id_v2"] == 135
+
+    def test_rebuild_rejects_duplicate_ids(self, tmp_path, monkeypatch):
+        self._setup_fake_sup(tmp_path, monkeypatch, dup=True)
+        with pytest.raises(SystemExit, match="重复"):
+            rsr.rebuild_metadata()

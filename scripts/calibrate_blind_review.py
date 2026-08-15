@@ -1137,18 +1137,123 @@ def apply_rule_v3(lc_record: dict, ai_record: dict | None, coverage_hit: bool | 
     }
 
 
+def load_merged_annotations(path: Path) -> list[dict]:
+    """读取合并后的 AI 标注文件（verdicts_ai_all_v1.jsonl），按 (route, question_id) 对齐。
+
+    与 align_records()（163 条 blind_id 对齐）互补：合并文件自带 route + question_id，
+    直接按键对齐；结构不合法直接抛 AlignError（fail-closed）。
+    """
+    rows = load_jsonl(path)
+    errors: list[str] = []
+    seen: set = set()
+    for r in rows:
+        key = (r.get("route"), r.get("question_id"))
+        if not key[0] or not key[1]:
+            errors.append(f"缺 route/question_id: {r.get('review_id', '?')}")
+            continue
+        if key in seen:
+            errors.append(f"重复 (route, question_id): {key}")
+        seen.add(key)
+        if r.get("verdict") not in VALID_VERDICTS:
+            errors.append(f"{key}: 非法 verdict={r.get('verdict')}")
+        if not r.get("au_status"):
+            errors.append(f"{key}: 空 au_status")
+        else:
+            for au_id, s in r["au_status"].items():
+                if s not in VALID_AU_STATUS:
+                    errors.append(f"{key}: 非法 au_status={s} (AU={au_id})")
+        fat = r.get("unsupported_fatality")
+        if fat is not None and fat not in VALID_FATALITY:
+            errors.append(f"{key}: 非法 unsupported_fatality={fat}")
+        for c in r.get("unsupported_claims", []):
+            if c.get("status") not in VALID_CLAIM_STATUS:
+                errors.append(f"{key}: 非法 claim status={c.get('status')}")
+    if errors:
+        raise AlignError("annotation-file 校验失败（fail-closed）:\n  "
+                         + "\n  ".join(errors[:20])
+                         + (f"\n  ... 共 {len(errors)} 项" if len(errors) > 20 else ""))
+    return rows
+
+
 def cmd_apply(args) -> int:
-    """阶段五：真实 coverage + adjudication_rule_v3 生成 480 条最终裁决（fail-closed）。"""
-    # 1) AI 对齐（fail-closed，v2 标注）
-    try:
-        records163 = align_records()
-    except AlignError as e:
-        print(f"ERROR: 对齐失败（fail-closed）:\n{e}", file=sys.stderr)
-        return 1
-    ai_by_route_qid = {(r["route"], r["qid"]): r for r in records163}
+    """阶段五：真实 coverage + adjudication_rule_v3 生成 480 条最终裁决（fail-closed）。
+
+    两种模式：
+    - 旧模式（无 --annotation-file）：163 条 blind_id 对齐，输出 ai_adjudication_v1
+      （向后兼容，pending 进 pending_supplementary.jsonl 队列）。
+    - 合并模式（--annotation-file + --output-version）：读 318 条合并标注，按
+      (route, question_id) 对齐，输出新目录（已存在默认报错，禁止静默覆盖）；
+      pending 记录进 excluded_records.jsonl 并附 exclusion_reason。
+    """
+    annotation_file = getattr(args, "annotation_file", None)
+    output_version = getattr(args, "output_version", None)
+    overwrite = bool(getattr(args, "overwrite", False))
+    merged_mode = annotation_file is not None
+    out_version_name = output_version or "ai_adjudication_v1"
+    out_dir = _JUDGE_DIR / out_version_name
+
+    if merged_mode:
+        ann_path = Path(annotation_file).resolve()
+        if not ann_path.exists():
+            print(f"ERROR: 标注文件不存在: {ann_path}", file=sys.stderr)
+            return 1
+        if out_dir.exists() and not overwrite:
+            print(f"ERROR: 输出目录已存在: {out_dir}（禁止静默覆盖；"
+                  f"确认放弃旧产物后加 --overwrite）", file=sys.stderr)
+            return 1
+        if out_version_name == "ai_adjudication_v1":
+            print("ERROR: --annotation-file 模式禁止写入 ai_adjudication_v1"
+                  "（旧目录必须保持不变），请指定 --output-version ai_adjudication_v2",
+                  file=sys.stderr)
+            return 1
+
+    # 1) AI 对齐（fail-closed）
+    records163 = None
+    if merged_mode:
+        try:
+            ann_rows = load_merged_annotations(ann_path)
+        except AlignError as e:
+            print(f"ERROR: 标注文件校验失败（fail-closed）:\n{e}", file=sys.stderr)
+            return 1
+        ai_by_route_qid = {
+            (r["route"], r["question_id"]): {
+                "au_status": r.get("au_status", {}),
+                "verdict": r.get("verdict", ""),
+                "unsupported_claims": r.get("unsupported_claims", []),
+                "unsupported_fatality": r.get("unsupported_fatality"),
+                "blind_id": r.get("blind_id"),
+                "review_source": r.get("review_source"),
+            }
+            for r in ann_rows
+        }
+    else:
+        try:
+            records163 = align_records()
+        except AlignError as e:
+            print(f"ERROR: 对齐失败（fail-closed）:\n{e}", file=sys.stderr)
+            return 1
+        ai_by_route_qid = {
+            (r["route"], r["qid"]): {
+                "au_status": r["ai_au_status"],
+                "verdict": r["ai_verdict"],
+                "unsupported_claims": r["ai_unsup_claims"],
+                "unsupported_fatality": r["ai_fatality"],
+                "blind_id": r["blind_id"],
+                "review_source": "original",
+            }
+            for r in records163
+        }
 
     longcat = load_longcat_verdicts()
     questions = load_questions()
+
+    # 标注键必须全部落在 480 条 LongCat 记录内（fail-closed）
+    lc_keys = {(route, qid) for route in ROUTES for qid in longcat.get(route, {})}
+    orphan = set(ai_by_route_qid) - lc_keys
+    if orphan:
+        print(f"ERROR: {len(orphan)} 条标注的 (route, question_id) 不在 LongCat 记录中: "
+              f"{sorted(orphan)[:5]}", file=sys.stderr)
+        return 1
 
     # 2) 真实 coverage（逐条复算，与冻结统计对账）
     cov_map = compute_coverage_map(longcat)
@@ -1174,14 +1279,16 @@ def cmd_apply(args) -> int:
             print(f"  {e}", file=sys.stderr)
         return 1
 
-    # 4) 候选答案（补充审核材料用）
+    # 4) 候选答案（补充审核材料用，仅旧模式队列需要）
     answers_by_route = {}
-    for route in ROUTES:
-        rf = _ROOT / jl.result_file(route, REPEAT, SEED, SNAPSHOT)
-        answers_by_route[route] = jl.load_results(rf) if rf.exists() else {}
+    if not merged_mode:
+        for route in ROUTES:
+            rf = _ROOT / jl.result_file(route, REPEAT, SEED, SNAPSHOT)
+            answers_by_route[route] = jl.load_results(rf) if rf.exists() else {}
 
     final_records = []
     pending_supplementary = []
+    excluded_records = []
     ai_reviewed_pending = 0
 
     for route in ROUTES:
@@ -1196,10 +1303,10 @@ def cmd_apply(args) -> int:
             ai_input = None
             if ai_r is not None:
                 ai_input = {
-                    "au_status": ai_r["ai_au_status"],
-                    "verdict": ai_r["ai_verdict"],
-                    "unsupported_claims": ai_r["ai_unsup_claims"],
-                    "unsupported_fatality": ai_r["ai_fatality"],
+                    "au_status": ai_r["au_status"],
+                    "verdict": ai_r["verdict"],
+                    "unsupported_claims": ai_r["unsupported_claims"],
+                    "unsupported_fatality": ai_r["unsupported_fatality"],
                 }
             lc_input = dict(lc)
             lc_input["route"] = route
@@ -1208,7 +1315,8 @@ def cmd_apply(args) -> int:
             final_records.append({
                 "route": route,
                 "question_id": qid,
-                "blind_id": ai_r["blind_id"] if ai_r else None,
+                "blind_id": (ai_r or {}).get("blind_id"),
+                "review_source": (ai_r or {}).get("review_source"),
                 "source": v["source"],
                 "answer_correctness": v["answer_correctness"],
                 "route_success": v["route_success"],
@@ -1234,29 +1342,60 @@ def cmd_apply(args) -> int:
             })
             if v["route_success"] == "pending":
                 if ai_r is None:
-                    # 补充审核队列：不含 163 条已审核；隐藏 route/blind_id
-                    pending_supplementary.append({
-                        "question_id": qid,
-                        "question": q.get("question", ""),
-                        "answer_units": [
-                            {"unit_id": u["unit_id"], "claim": u.get("claim", ""),
-                             "required": bool(u.get("required", True))}
-                            for u in q.get("answer_units", [])
-                        ],
-                        "evidence_spans": {
-                            es["unit_id"]: es["evidence_spans"]
-                            for es in q.get("evidence_spans", [])
-                        },
-                        "candidate_answer": answers_by_route.get(route, {}).get(qid, ""),
-                        "lc_verdict": lc.get("verdict"),
-                        "lc_derived_verdict": lc.get("derived_verdict"),
-                        "coverage_hit": cov["coverage_hit"],
-                        "evidence_requirements_hit": cov["evidence_requirements_hit"],
-                        "evidence_requirements_total": cov["evidence_requirements_total"],
-                        "reason": "no_ai_review",
-                    })
+                    if merged_mode:
+                        # 合并模式：pending 不再排队补充审核，直接进排除清单
+                        excluded_records.append({
+                            "route": route,
+                            "question_id": qid,
+                            "blind_id": None,
+                            "review_source": None,
+                            "source": "longcat_only",
+                            "answer_correctness": v["answer_correctness"],
+                            "route_success": "pending",
+                            "exclusion_reason": "no_ai_review_pending",
+                            "ai_verdict": None,
+                            "coverage_hit": cov["coverage_hit"],
+                            "has_unresolved_claim": None,
+                        })
+                    else:
+                        # 补充审核队列：不含 163 条已审核；隐藏 route/blind_id
+                        pending_supplementary.append({
+                            "question_id": qid,
+                            "question": q.get("question", ""),
+                            "answer_units": [
+                                {"unit_id": u["unit_id"], "claim": u.get("claim", ""),
+                                 "required": bool(u.get("required", True))}
+                                for u in q.get("answer_units", [])
+                            ],
+                            "evidence_spans": {
+                                es["unit_id"]: es["evidence_spans"]
+                                for es in q.get("evidence_spans", [])
+                            },
+                            "candidate_answer": answers_by_route.get(route, {}).get(qid, ""),
+                            "lc_verdict": lc.get("verdict"),
+                            "lc_derived_verdict": lc.get("derived_verdict"),
+                            "coverage_hit": cov["coverage_hit"],
+                            "evidence_requirements_hit": cov["evidence_requirements_hit"],
+                            "evidence_requirements_total": cov["evidence_requirements_total"],
+                            "reason": "no_ai_review",
+                        })
                 else:
                     ai_reviewed_pending += 1
+                    if merged_mode:
+                        # 已审核但 unresolved 悬置：uncertain 不强转 pass/fail，进排除清单
+                        excluded_records.append({
+                            "route": route,
+                            "question_id": qid,
+                            "blind_id": ai_r.get("blind_id"),
+                            "review_source": ai_r.get("review_source"),
+                            "source": "ai_review",
+                            "answer_correctness": v["answer_correctness"],
+                            "route_success": "pending",
+                            "exclusion_reason": "unresolved_claims_pending",
+                            "ai_verdict": v["ai_verdict"],
+                            "coverage_hit": cov["coverage_hit"],
+                            "has_unresolved_claim": v["has_unresolved_claim"],
+                        })
 
     # 5) 480 条约束校验
     keys = [(r["route"], r["question_id"]) for r in final_records]
@@ -1270,8 +1409,14 @@ def cmd_apply(args) -> int:
             print(f"ERROR: {route} {n} 条 != 80", file=sys.stderr)
             return 1
 
-    # 6) 输出四件套
-    out_dir = _JUDGE_DIR / "ai_adjudication_v1"
+    # 合并模式额外对账：标注数 + 未审核数
+    ai_reviewed_total = sum(1 for r in final_records if r["source"] == "ai_review")
+    if merged_mode and ai_reviewed_total != len(ai_by_route_qid):
+        print(f"ERROR: ai_review 记录 {ai_reviewed_total} != 标注数 {len(ai_by_route_qid)}",
+              file=sys.stderr)
+        return 1
+
+    # 6) 输出
     out_dir.mkdir(parents=True, exist_ok=True)
 
     fv_path = out_dir / "final_verdicts.jsonl"
@@ -1295,26 +1440,49 @@ def cmd_apply(args) -> int:
     summary_out = {
         "adjudication_rule_version": ADJUDICATION_RULE_VERSION,
         "coverage_rule_version": jl.COVERAGE_RULE_VERSION,
+        "apply_mode": "merged_annotation" if merged_mode else "blind_id_align_163",
+        "output_version": out_version_name,
         "total_records": len(final_records),
         "route_success_dist": dict(rs_dist),
         "answer_correctness_dist": dict(ac_dist),
         "by_route": by_route,
-        "ai_annotated_records": len(records163),
+        "ai_annotated_records": len(records163) if records163 is not None else len(ai_by_route_qid),
         "ai_reviewed_pending": ai_reviewed_pending,
-        "pending_supplementary_count": len(pending_supplementary),
         "coverage_frozen_check": {
             "expected_pass": FROZEN_COVERAGE_PASS,
             "recomputed_pass": {r: cov_stats[r]["pass"] for r in FROZEN_COVERAGE_PASS},
             "match": True,
         },
     }
+    if merged_mode:
+        pgold = [r for r in final_records if r["route"] == "P_gold"]
+        pgold_dist = Counter(r["route_success"] for r in pgold)
+        summary_out.update({
+            "annotation_file": ann_path.name,
+            "annotation_count": len(ai_by_route_qid),
+            "unreviewed_count": 480 - ai_reviewed_total,
+            "excluded_count": len(excluded_records),
+            "exclusion_reason_dist": dict(Counter(r["exclusion_reason"]
+                                                  for r in excluded_records)),
+            "P_gold_route_success": {k: pgold_dist.get(k, 0)
+                                     for k in ("pass", "fail", "pending")},
+            "note": ("合并标注 apply：318 条 AI 审核按 (route, question_id) 对齐；"
+                     "未审核 162 条 coverage 硬失败记 route_success=fail；"
+                     "uncertain/unresolved 不强转 pass-fail，进 excluded_records.jsonl"),
+        })
     fs_path = out_dir / "final_summary.json"
     fs_path.write_text(json.dumps(summary_out, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    sup_path = out_dir / "pending_supplementary.jsonl"
-    with open(sup_path, "w", encoding="utf-8") as f:
-        for r in pending_supplementary:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    if merged_mode:
+        ex_path = out_dir / "excluded_records.jsonl"
+        with open(ex_path, "w", encoding="utf-8") as f:
+            for r in excluded_records:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    else:
+        sup_path = out_dir / "pending_supplementary.jsonl"
+        with open(sup_path, "w", encoding="utf-8") as f:
+            for r in pending_supplementary:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
     # 7) manifest（全量 SHA-256 溯源）
     input_hashes = {
@@ -1330,18 +1498,36 @@ def cmd_apply(args) -> int:
             for route in ROUTES
         },
     }
+    if merged_mode:
+        input_hashes["annotation_file"] = sha256_file(ann_path)
+        ann_meta_path = ann_path.parent / "review_metadata.json"
+        annotation_provenance = None
+        if ann_meta_path.exists():
+            am = json.loads(ann_meta_path.read_text(encoding="utf-8"))
+            annotation_provenance = {
+                "supplementary_review_metadata": str(ann_meta_path.relative_to(_ROOT)),
+                "sha256": sha256_file(ann_meta_path),
+                "review_model": am.get("review_model"),
+                "review_provider": am.get("review_provider"),
+                "review_temperature": am.get("review_temperature"),
+                "note": ("仅覆盖 set_D(155)/set_E(12) 补充审核溯源；"
+                         "原 163 条标注的审核模型不在本 manifest 声明范围（CLI 未提供则 unknown）"),
+            }
     provenance = _provenance(args)
     manifest_out = {
         "adjudication_rule_version": ADJUDICATION_RULE_VERSION,
         "coverage_rule_version": jl.COVERAGE_RULE_VERSION,
+        "apply_mode": "merged_annotation" if merged_mode else "blind_id_align_163",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "repeat": REPEAT, "seed": SEED, "snapshot": SNAPSHOT,
         "counts": {
             "total_records": len(final_records),
             "per_route": {route: 80 for route in ROUTES},
-            "ai_annotated": len(records163),
+            "ai_annotated": len(records163) if records163 is not None else len(ai_by_route_qid),
             "ai_reviewed_pending": ai_reviewed_pending,
-            "pending_supplementary": len(pending_supplementary),
+            "unreviewed": 480 - ai_reviewed_total,
+            "excluded": len(excluded_records) if merged_mode else None,
+            "pending_supplementary": len(pending_supplementary) if not merged_mode else None,
         },
         "coverage_recomputation": {
             "method": "judge_longcat.calc_source_evidence_coverage 逐条复算（P2-P4 sources 区段，P1/P_gold 全文，P0 无门槛）",
@@ -1349,6 +1535,7 @@ def cmd_apply(args) -> int:
             "expected_pass": FROZEN_COVERAGE_PASS,
         },
         "provenance": provenance,
+        "annotation_provenance": annotation_provenance if merged_mode else None,
         "claim_fatality_derivation": {
             "claim_mapping": dict(CLAIM_FATALITY_MAP),
             "record_priority": list(RECORD_FATALITY_PRIORITY),
@@ -1357,21 +1544,35 @@ def cmd_apply(args) -> int:
         "script_sha256": sha256_file(Path(__file__).resolve()),
         "judge_script_sha256": sha256_file(Path(jl.__file__).resolve()),
         "input_sha256": input_hashes,
-        "output_sha256": {
+        "note": "final_verdicts.jsonl 不覆盖原始 LongCat 判定；原始数据保留在 *_verdict.jsonl",
+    }
+    if merged_mode:
+        manifest_out["output_sha256"] = {
+            "final_verdicts.jsonl": sha256_file(fv_path),
+            "final_summary.json": sha256_file(fs_path),
+            "excluded_records.jsonl": sha256_file(ex_path),
+        }
+    else:
+        manifest_out["output_sha256"] = {
             "final_verdicts.jsonl": sha256_file(fv_path),
             "final_summary.json": sha256_file(fs_path),
             "pending_supplementary.jsonl": sha256_file(sup_path),
-        },
-        "note": "final_verdicts.jsonl 不覆盖原始 LongCat 判定；原始数据保留在 *_verdict.jsonl",
-    }
+        }
     (out_dir / "manifest.json").write_text(
         json.dumps(manifest_out, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print(f"最终裁决已生成: {out_dir}/")
     print(f"  final_verdicts.jsonl: {len(final_records)} 条（六路径各 80，(route,qid) 唯一）")
     print(f"  final_summary.json")
-    print(f"  pending_supplementary.jsonl: {len(pending_supplementary)} 条（不含已审核 163 条，隐藏 route）")
-    print(f"  manifest.json（全量 SHA-256）")
+    if merged_mode:
+        print(f"  excluded_records.jsonl: {len(excluded_records)} 条"
+              f"（route_success=pending 全量，含 exclusion_reason）")
+        print(f"  manifest.json（全量 SHA-256，标注 {len(ai_by_route_qid)} 条 + "
+              f"未审核 {480 - ai_reviewed_total} 条）")
+        print(f"  P_gold route_success: {summary_out['P_gold_route_success']}")
+    else:
+        print(f"  pending_supplementary.jsonl: {len(pending_supplementary)} 条（不含已审核 163 条，隐藏 route）")
+        print(f"  manifest.json（全量 SHA-256）")
     print(f"  coverage 复算与冻结统计一致: {FROZEN_COVERAGE_PASS}")
     print(f"  已审核但仍 pending（unresolved 悬置）: {ai_reviewed_pending} 条")
     return 0
@@ -1426,6 +1627,14 @@ def main():
     parser = argparse.ArgumentParser(description="盲审校准脚本（validate / report / apply）")
     parser.add_argument("--mode", required=True, choices=["validate", "report", "apply"],
                         help="运行模式: validate(校验+v2派生) / report(指标) / apply(最终裁决)")
+    parser.add_argument("--annotation-file", default=None,
+                        help="apply 模式：合并后的 AI 标注文件（如 verdicts_ai_all_v1.jsonl，"
+                             "须含 route + question_id，按键对齐；不传则走旧 163 条 blind_id 对齐）")
+    parser.add_argument("--output-version", default=None,
+                        help="apply 模式：输出目录名（如 ai_adjudication_v2）；"
+                             "目录已存在时默认报错，禁止静默覆盖")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="配合 --output-version：允许覆盖已存在的输出目录")
     # 审核元数据（问题五：禁止硬编码，不可证明写 unknown + provenance_complete=false）
     parser.add_argument("--review-model", default=None,
                         help="AI 审核所用模型名；无法证明则不传（记 unknown）")

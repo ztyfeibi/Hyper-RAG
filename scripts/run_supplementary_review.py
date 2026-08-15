@@ -28,6 +28,7 @@ import re
 import sys
 import time
 import uuid
+from collections import Counter
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -367,6 +368,76 @@ def write_metadata(all_stats: dict, args) -> Path:
     return out
 
 
+def rebuild_metadata() -> Path:
+    """离线重建 review_metadata.json（不调模型）。
+
+    背景：write_metadata 的 stats 只反映"本次进程"的新增（done=本次写入数），多次
+    断点续跑后 metadata 会陈旧（如最后一轮只记 done=3/1）。离线重建以输出文件的
+    累计记录数为准：stats.<set>.done = 输出文件总条数；另记 new/skipped（离线
+    重建恒为 0）、response_schema 分布与输出文件 SHA-256。
+    """
+    provider = ("SiliconFlow" if "siliconflow" in LLM_BASE_URL_SILICONFLOW
+                else "local-vllm")
+    stats = {}
+    output_info = {}
+    for s in ("D", "E"):
+        path = SET_OUTPUT[s]
+        rows = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines()
+                if l.strip()]
+        templates = load_templates(s)
+        existing_ids = {r["review_id"] for r in rows}
+        if len(existing_ids) != len(rows):
+            dupes = [rid for rid, c in Counter(
+                r["review_id"] for r in rows).items() if c > 1]
+            raise SystemExit(f"[set {s}] 输出文件存在重复 review_id: {dupes}")
+        schema_dist = Counter(r.get("response_schema") or "legacy" for r in rows)
+        stats[s] = {
+            "done": len(rows),                 # 最终输出累计数量
+            "total_templates": len(templates),
+            "todo": sum(1 for t in templates if t["review_id"] not in existing_ids),
+            "new_this_run": 0,                 # 离线重建：无新增
+            "skipped_this_run": 0,             # 离线重建：无跳过
+            "response_schema_dist": dict(schema_dist),
+        }
+        output_info[s] = {
+            "file": path.name,
+            "n": len(rows),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+
+    meta = {
+        "annotation_type": "supplementary_ai_review",
+        "review_model": LLM_MODEL_SILICONFLOW,
+        "review_provider": provider,
+        "review_base_url": LLM_BASE_URL_SILICONFLOW,
+        "review_temperature": TEMPERATURE,
+        "review_max_tokens": MAX_TOKENS,
+        "review_disable_thinking": True,
+        "rebuilt_offline": True,
+        "rebuild_note": ("离线重建：stats.done 为输出文件累计条数（非单次进程新增）；"
+                         "new/skipped_this_run 恒为 0，历史各轮新增见 git log / 终端日志"),
+        "prompt_guide_sha256": sha256_text(
+            (SUP_DIR / "REVIEW_GUIDE.md").read_text(encoding="utf-8")),
+        "material_md_sha256": {
+            s: sha256_text(SET_MD[s].read_text(encoding="utf-8"))
+            for s in ("D", "E")
+        },
+        "template_sha256": {
+            s: sha256_text(SET_TEMPLATE[s].read_text(encoding="utf-8"))
+            for s in ("D", "E")
+        },
+        "script_sha256": hashlib.sha256(
+            Path(__file__).read_bytes()).hexdigest(),
+        "stats": stats,
+        "output_files": output_info,
+        "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    out = SUP_DIR / "review_metadata.json"
+    out.write_text(json.dumps(meta, ensure_ascii=False, indent=2),
+                   encoding="utf-8")
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description="补充盲审执行（set_D/set_E AI 审核）")
     ap.add_argument("--set", default="both", choices=["D", "E", "both"])
@@ -376,7 +447,15 @@ def main():
                     help="单条校验不合格时的最大尝试次数")
     ap.add_argument("--dry-run", action="store_true",
                     help="只统计待跑数量，不调 API")
+    ap.add_argument("--rebuild-metadata", action="store_true",
+                    help="离线重建 review_metadata.json（不调模型）：stats 以输出文件"
+                         "累计数为准，并记录输出 SHA-256")
     args = ap.parse_args()
+
+    if args.rebuild_metadata:
+        meta_path = rebuild_metadata()
+        print(f"review_metadata.json (rebuilt) -> {meta_path}")
+        return
 
     sets = ["D", "E"] if args.set == "both" else [args.set]
     all_stats = {}
