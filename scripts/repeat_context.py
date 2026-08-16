@@ -11,6 +11,7 @@ RepeatContext 派生路径，不再硬编码 r0/s42。
 """
 from __future__ import annotations
 
+import contextlib
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -126,3 +127,54 @@ class RepeatContext:
 
 
 DEFAULT_RC = RepeatContext.default()
+
+# ---------------------------------------------------------------------------
+# 上下文恢复（测试隔离）
+# ---------------------------------------------------------------------------
+# 4 个裁决脚本各自定义模块级 set_context()，会改写全局 _RC/REPEAT/SEED/OUT_DIR/
+# FINAL/SUP_DIR/ANN/OUT 等。测试若调用 set_context(ri) 而不还原，会污染后续 r0 测试
+# （误读非默认 repeat 的 D/E 补充审核材料）。reset_context() 将所有脚本全局恢复到
+# 默认 r0/s42；tests/conftest.py 的 autouse fixture 在每个用例结束后调用它，保证
+# 测试间零泄漏。
+_RESET_MODS = (
+    "calibrate_blind_review",
+    "build_supplementary_review",
+    "run_supplementary_review",
+    "merge_supplementary_verdicts",
+)
+
+
+def _apply_context(rc: "RepeatContext") -> None:
+    """对全部裁决脚本应用同一 rc（链式 set_context，幂等）。"""
+    for name in _RESET_MODS:
+        mod = sys.modules.get(name)
+        if mod is not None and hasattr(mod, "set_context"):
+            mod.set_context(rc)
+
+
+def reset_context() -> None:
+    """恢复所有裁决脚本的模块级全局到默认 r0/s42（向后兼容基线）。
+
+    测试在每个用例结束后应调用（或经由 conftest 的 autouse fixture），
+    防止 set_context(ri) 修改的全局泄漏到后续 r0 测试，使其误读非默认 repeat
+    的 D/E 补充审核材料。
+    """
+    _apply_context(DEFAULT_RC)
+
+
+@contextlib.contextmanager
+def using_context(rc: "RepeatContext"):
+    """临时切换全局上下文，退出时自动 reset_context()。
+
+    等价手动写法：
+        msv.set_context(rc)
+        try:
+            ...
+        finally:
+            repeat_context.reset_context()
+    """
+    _apply_context(rc)
+    try:
+        yield rc
+    finally:
+        reset_context()
