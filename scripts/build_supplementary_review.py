@@ -57,12 +57,43 @@ def _import_judge_longcat():
 
 jl = _import_judge_longcat()
 
+from repeat_context import RepeatContext, DEFAULT_RC  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# 路径 / 运行参数（RepeatContext 派生；r0/s42 默认值向后兼容）
+# ---------------------------------------------------------------------------
+_RC: RepeatContext = DEFAULT_RC
 REPEAT, SEED = 0, 42
-OUT_DIR = jl.out_dir(REPEAT, SEED, jl.SNAPSHOT_DEFAULT)
-FV_FILE = OUT_DIR / "ai_adjudication_v1" / "final_verdicts.jsonl"
-SUP_DIR = OUT_DIR / "blind_review_supplementary"
+OUT_DIR = DEFAULT_RC.judge_dir
+# 新 repeat 用 ai_adjudication_pre（--no-annotations 产物）；r0 用 ai_adjudication_v1
+_PRE_DIR_NAME = "ai_adjudication_pre"
+_V1_DIR_NAME = "ai_adjudication_v1"
+FV_FILE = OUT_DIR / _V1_DIR_NAME / "final_verdicts.jsonl"
+SUP_DIR = DEFAULT_RC.supplementary_dir
 AI_ANNOTATED = OUT_DIR / "blind_review" / "verdicts_ai_annotated.jsonl"
 
+
+def set_context(rc: RepeatContext) -> None:
+    """切换活跃 RepeatContext."""
+    global _RC, REPEAT, SEED, OUT_DIR, FV_FILE, SUP_DIR, AI_ANNOTATED
+    _RC = rc
+    REPEAT = rc.repeat
+    SEED = rc.seed
+    OUT_DIR = rc.judge_dir
+    # r0 用 v1（有 163 条 blind_id 对齐产物）；r1+ 用 pre（--no-annotations 产物）
+    vname = _V1_DIR_NAME if rc.repeat == 0 else _PRE_DIR_NAME
+    FV_FILE = OUT_DIR / vname / "final_verdicts.jsonl"
+    SUP_DIR = rc.supplementary_dir
+    AI_ANNOTATED = rc.blind_dir / "verdicts_ai_annotated.jsonl"
+
+
+def _fv_path_for_rc(rc: RepeatContext) -> Path:
+    """获取当前 repeat 的 final_verdicts 路径（r0=v1, r1+=pre）."""
+    vname = _V1_DIR_NAME if rc.repeat == 0 else _PRE_DIR_NAME
+    return rc.judge_dir / vname / "final_verdicts.jsonl"
+
+
+# r0 冻结值（仅 r0 校验用；r1+ 从 final_verdicts 动态派生）
 EXPECTED_D, EXPECTED_E = 155, 12
 
 # 路径泄漏检查：审核材料中不允许出现 route 名 / qid / 本地路径碎片
@@ -74,11 +105,19 @@ _LEAK_PATTERNS = [
 ]
 
 CLAIM_STATUS_OPTIONS = "supported_by_source|unsupported_noncritical|contradicted|unverifiable"
-FATALITY_OPTIONS = "none|harmless|fatal"
+# 与 run_supplementary_review.FATALITY_OPTIONS / calibrate.VALID_FATALITY 统一（v2: 含 unresolved）
+FATALITY_OPTIONS = "none|harmless|fatal|unresolved"
 
 
-def load_final_verdicts(path=FV_FILE):
-    rows = [json.loads(l) for l in open(path, encoding="utf-8")]
+def load_final_verdicts(path=None, rc=None):
+    """加载 final_verdicts，按 source/route_success 拆分 set_D / set_E。
+
+    r0: 校验 EXPECTED_D=155 / EXPECTED_E=12（冻结值）。
+    r1+: 从实际 pending 记录动态派生，不校验固定计数。
+    """
+    ctx = rc or _RC
+    fv_path = Path(path) if path else _fv_path_for_rc(ctx)
+    rows = [json.loads(l) for l in open(fv_path, encoding="utf-8")]
     set_d = sorted((r for r in rows
                     if r.get("source") == "longcat_only"
                     and r.get("route_success") == "pending"),
@@ -87,10 +126,11 @@ def load_final_verdicts(path=FV_FILE):
                     if r.get("source") == "ai_review"
                     and r.get("route_success") == "pending"),
                    key=lambda r: (r["route"], r["question_id"]))
-    if len(set_d) != EXPECTED_D:
-        raise SystemExit(f"set_D 应为 {EXPECTED_D} 条，实际 {len(set_d)}")
-    if len(set_e) != EXPECTED_E:
-        raise SystemExit(f"set_E 应为 {EXPECTED_E} 条，实际 {len(set_e)}")
+    if ctx.repeat == 0:
+        if len(set_d) != EXPECTED_D:
+            raise SystemExit(f"set_D 应为 {EXPECTED_D} 条，实际 {len(set_d)}")
+        if len(set_e) != EXPECTED_E:
+            raise SystemExit(f"set_E 应为 {EXPECTED_E} 条，实际 {len(set_e)}")
     keys = [(r["route"], r["question_id"]) for r in set_d + set_e]
     if len(set(keys)) != len(keys):
         raise SystemExit("(route, question_id) 存在重复")
@@ -111,10 +151,11 @@ def load_questions_with_spans():
     return out
 
 
-def load_candidate_answers():
+def load_candidate_answers(rc=None):
+    ctx = rc or _RC
     out = {}
     for route in jl.ROUTES:
-        rf = _ROOT / jl.result_file(route, REPEAT, SEED, jl.SNAPSHOT_DEFAULT)
+        rf = _ROOT / ctx.result_file(route)
         if not rf.exists():
             continue
         out[route] = {r["question_id"]: r.get("result") or ""
@@ -122,11 +163,14 @@ def load_candidate_answers():
     return out
 
 
-def load_longcat_verdicts():
+def load_longcat_verdicts(rc=None):
     """(route, qid) -> verdict 记录（取 unsupported_claims 文本列表）。"""
+    ctx = rc or _RC
     out = {}
     for route in jl.ROUTES:
-        f = OUT_DIR / f"{route}_verdict.jsonl"
+        f = ctx.verdict_file(route)
+        if not f.exists():
+            continue
         for line in open(f, encoding="utf-8"):
             r = json.loads(line)
             out[(route, r["question_id"])] = r
@@ -139,8 +183,12 @@ def load_ai_annotations():
             for l in open(AI_ANNOTATED, encoding="utf-8")}
 
 
-def review_id(prefix, idx):
-    return f"SR-{prefix}-{idx:03d}"
+def review_id(prefix, idx, rc=None):
+    """R{repeat}-{prefix}-{idx:03d}（r0 向后兼容用 SR-{prefix}-{idx:03d}）."""
+    ctx = rc or _RC
+    if ctx.repeat == 0:
+        return f"SR-{prefix}-{idx:03d}"
+    return f"R{ctx.repeat}-{prefix}-{idx:03d}"
 
 
 def render_record(rid, meta, candidate, claims_text, lc_required_aus,
@@ -260,27 +308,35 @@ def check_no_leak(text, where):
             raise SystemExit(f"材料泄漏检查失败 [{where}]: 命中 {pat.pattern!r} -> {m.group(0)!r}")
 
 
-def run_build(out_dir=None):
-    out_dir = Path(out_dir) if out_dir else SUP_DIR
-    set_d, set_e = load_final_verdicts()
+def run_build(out_dir=None, rc=None):
+    ctx = rc or _RC
+    out_dir = Path(out_dir) if out_dir else ctx.supplementary_dir
+    set_d, set_e = load_final_verdicts(rc=ctx)
     questions = load_questions_with_spans()
-    candidates = load_candidate_answers()
-    lc_verdicts = load_longcat_verdicts()
-    ai_ann = load_ai_annotations()
+    candidates = load_candidate_answers(ctx)
+    lc_verdicts = load_longcat_verdicts(ctx)
+    ai_ann = load_ai_annotations() if ctx.repeat == 0 else {}
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    n_d, n_e = len(set_d), len(set_e)
     d_ids, e_ids = [], []
-    for i, r in enumerate(set_d, start=1):
-        d_ids.append(review_id("D", i))
-    for i, r in enumerate(set_e, start=1):
-        e_ids.append(review_id("E", i))
+    for i in range(1, n_d + 1):
+        d_ids.append(review_id("D", i, ctx))
+    for i in range(1, n_e + 1):
+        e_ids.append(review_id("E", i, ctx))
     all_ids = d_ids + e_ids
     if len(set(all_ids)) != len(all_ids):
         raise SystemExit("review_id 存在重复")
 
+    # 动态文件名：set_D_unreviewed_{N}.md / set_E_recheck_{N}.md
+    d_md_name = f"set_D_unreviewed_{n_d}.md"
+    e_md_name = f"set_E_recheck_{n_e}.md"
+    d_tpl_name = "verdicts_template_D.jsonl"
+    e_tpl_name = "verdicts_template_E.jsonl"
+
     # ---- set_D md + 模板 ----
-    d_md = ["# 补充盲审材料 set_D（未审核悬置 155 条）\n\n"
+    d_md = [f"# 补充盲审材料 set_D（未审核悬置 {n_d} 条）\n\n"
             "判定规则见 REVIEW_GUIDE.md（source-grounded；uncertain 不得强行改 fail）。\n\n"]
     d_template = []
     for rid, r in zip(d_ids, set_d):
@@ -298,15 +354,23 @@ def run_build(out_dir=None):
             "notes": "",
         })
 
-    # ---- set_E md + 模板（复核：附原 AI 判定）----
-    e_md = ["# 补充盲审材料 set_E（复核 12 条，原审核结果悬置）\n\n"
+    # ---- set_E md + 模板（复核：附原 AI 判定；r1+ 无原标注则跳过 original）----
+    e_md = [f"# 补充盲审材料 set_E（复核 {n_e} 条，原审核结果悬置）\n\n"
             "判定规则见 REVIEW_GUIDE.md。本集为复核：请独立重判，结果将覆盖原记录。\n\n"]
     e_template = []
     for rid, r in zip(e_ids, set_e):
         meta = questions[r["question_id"]]
         cand = (candidates.get(r["route"]) or {}).get(r["question_id"], "")
-        orig = ai_ann[r["blind_id"]]
-        claims = [c.get("claim") for c in (orig.get("unsupported_claims") or [])]
+        orig = ai_ann.get(r.get("blind_id")) if r.get("blind_id") else None
+        if orig is not None:
+            claims = [c.get("claim") for c in (orig.get("unsupported_claims") or [])]
+        else:
+            # r1+ 无原标注：用 final_verdicts 的 AI claims
+            claims = [c.get("claim") for c in (r.get("unsupported_claims") or [])] if isinstance(r.get("unsupported_claims"), list) else []
+            # fallback: 从 lc_verdicts 取
+            if not claims:
+                lc = lc_verdicts.get((r["route"], r["question_id"]), {})
+                claims = lc.get("unsupported_claims") or []
         e_md.append(render_record(rid, meta, cand, claims, r.get("required_aus"),
                                   original=orig))
         e_template.append({
@@ -324,26 +388,29 @@ def run_build(out_dir=None):
                        ("template_E", json.dumps(e_template, ensure_ascii=False))]:
         check_no_leak(text, name)
 
-    (out_dir / "set_D_unreviewed_155.md").write_text("\n".join(d_md), encoding="utf-8")
-    (out_dir / "set_E_recheck_12.md").write_text("\n".join(e_md), encoding="utf-8")
-    with open(out_dir / "verdicts_template_D.jsonl", "w", encoding="utf-8") as f:
+    (out_dir / d_md_name).write_text("\n".join(d_md), encoding="utf-8")
+    (out_dir / e_md_name).write_text("\n".join(e_md), encoding="utf-8")
+    with open(out_dir / d_tpl_name, "w", encoding="utf-8") as f:
         for e in d_template:
             f.write(json.dumps(e, ensure_ascii=False) + "\n")
-    with open(out_dir / "verdicts_template_E.jsonl", "w", encoding="utf-8") as f:
+    with open(out_dir / e_tpl_name, "w", encoding="utf-8") as f:
         for e in e_template:
             f.write(json.dumps(e, ensure_ascii=False) + "\n")
     (out_dir / "REVIEW_GUIDE.md").write_text(REVIEW_GUIDE_TEXT, encoding="utf-8")
 
-    # ---- sample_manifest.json：review_id <-> (route, qid, blind_id) 映射（内部）----
+    # ---- sample_manifest.json：动态键名 ----
+    fv_source = "ai_adjudication_v1/final_verdicts.jsonl" if ctx.repeat == 0 else "ai_adjudication_pre/final_verdicts.jsonl"
     manifest = {
-        "source_final_verdicts": "ai_adjudication_v1/final_verdicts.jsonl",
+        "source_final_verdicts": fv_source,
         "adjudication_rule_version": "v3",
-        "set_D_unreviewed_155": [
+        "repeat": ctx.repeat,
+        "seed": ctx.seed,
+        f"set_D_unreviewed_{n_d}": [
             {"review_id": rid, "route": r["route"], "question_id": r["question_id"],
              "blind_id": None, "lc_verdict": r.get("lc_verdict"),
              "required_aus": r.get("required_aus")}
             for rid, r in zip(d_ids, set_d)],
-        "set_E_recheck_12": [
+        f"set_E_recheck_{n_e}": [
             {"review_id": rid, "route": r["route"], "question_id": r["question_id"],
              "blind_id": r.get("blind_id"), "lc_verdict": r.get("lc_verdict"),
              "ai_verdict": r.get("ai_verdict"),
@@ -355,10 +422,12 @@ def run_build(out_dir=None):
 
     return {
         "out_dir": out_dir,
-        "set_d": len(set_d), "set_e": len(set_e),
+        "set_d": n_d, "set_e": n_e,
         "review_ids": len(all_ids),
         "d_claims_prefilled": sum(len(e["unsupported_claims"]) for e in d_template),
         "e_claims_prefilled": sum(len(e["unsupported_claims"]) for e in e_template),
+        "d_md_name": d_md_name,
+        "e_md_name": e_md_name,
     }
 
 
@@ -368,12 +437,25 @@ def main():
                     help="build=生成材料（validate/merge 在 Step 3 启用）")
     ap.add_argument("--out-dir", default=None,
                     help="输出目录（默认 judge 目录下 blind_review_supplementary/；测试重定向用）")
+    ap.add_argument("--data-name", default="neurology_chunk1000")
+    ap.add_argument("--repeat", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--snapshot", default=None,
+                    help="系统快照 ID（默认 jl.SNAPSHOT_DEFAULT）")
     args = ap.parse_args()
 
-    info = run_build(out_dir=args.out_dir)
+    rc = RepeatContext(
+        data_name=args.data_name,
+        repeat=args.repeat,
+        seed=args.seed,
+        snapshot=args.snapshot or jl.SNAPSHOT_DEFAULT,
+    )
+    set_context(rc)
+
+    info = run_build(out_dir=args.out_dir, rc=rc)
     print(f"补充盲审集已生成: {info['out_dir']}/")
-    print(f"  set_D（未审核悬置）: {info['set_d']} 条 -> set_D_unreviewed_155.md / verdicts_template_D.jsonl")
-    print(f"  set_E（复核）: {info['set_e']} 条 -> set_E_recheck_12.md / verdicts_template_E.jsonl")
+    print(f"  set_D（未审核悬置）: {info['set_d']} 条 -> {info['d_md_name']} / verdicts_template_D.jsonl")
+    print(f"  set_E（复核）: {info['set_e']} 条 -> {info['e_md_name']} / verdicts_template_E.jsonl")
     print(f"  review_id 总数: {info['review_ids']}（唯一）")
     print(f"  预填待判 claims: D={info['d_claims_prefilled']} 条, E={info['e_claims_prefilled']} 条")
     print(f"  REVIEW_GUIDE.md / sample_manifest.json（内部映射，不随材料分发）")

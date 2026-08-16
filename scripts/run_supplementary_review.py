@@ -41,6 +41,54 @@ REPEAT, SEED = 0, 42
 _SCRIPTS = _ROOT / "scripts"
 sys.path.insert(0, str(_SCRIPTS))
 import build_supplementary_review as bsr  # noqa: E402  (复用 OUT_DIR / SUP_DIR 常量)
+from repeat_context import RepeatContext, DEFAULT_RC  # noqa: E402
+
+_RC: RepeatContext = DEFAULT_RC
+
+
+def _discover_set_md(sup_dir: Path, set_name: str) -> Path | None:
+    """Glob 发现 set 材料文件（文件名含动态条数，不能硬编码）."""
+    pattern = (f"set_{set_name}_unreviewed_*.md" if set_name == "D"
+               else f"set_{set_name}_recheck_*.md")
+    matches = sorted(sup_dir.glob(pattern))
+    return matches[0] if matches else None
+
+
+def _refresh_set_paths(rc: RepeatContext) -> None:
+    """根据 RepeatContext 刷新 SET_MD / SET_TEMPLATE / SET_OUTPUT.
+
+    - SET_MD: glob 发现（文件名含动态条数 N）
+    - SET_TEMPLATE / SET_OUTPUT: 固定文件名
+    - 仅包含文件存在的 set（E 可能未生成）
+    """
+    global SET_MD, SET_TEMPLATE, SET_OUTPUT
+    sup = rc.supplementary_dir
+    set_md, set_template, set_output = {}, {}, {}
+    for s in ("D", "E"):
+        md = _discover_set_md(sup, s)
+        if md:
+            set_md[s] = md
+        tpl = sup / f"verdicts_template_{s}.jsonl"
+        if tpl.exists():
+            set_template[s] = tpl
+        out_name = (f"verdicts_ai_supplementary_{s}.jsonl" if s == "D"
+                    else f"verdicts_ai_recheck_{s}.jsonl")
+        set_output[s] = sup / out_name
+    SET_MD = set_md
+    SET_TEMPLATE = set_template
+    SET_OUTPUT = set_output
+
+
+def set_context(rc: RepeatContext) -> None:
+    """切换活跃 RepeatContext（同时更新 bsr 和 SET_* 路径）."""
+    global _RC, REPEAT, SEED, SUP_DIR
+    _RC = rc
+    REPEAT = rc.repeat
+    SEED = rc.seed
+    bsr.set_context(rc)
+    SUP_DIR = rc.supplementary_dir
+    _refresh_set_paths(rc)
+
 
 SUP_DIR = bsr.SUP_DIR
 
@@ -56,12 +104,11 @@ FATALITY_OPTIONS = {"none", "harmless", "fatal", "unresolved"}
 CLAIM_STATUS_OPTIONS = {"supported_by_source", "unsupported_noncritical",
                         "contradicted", "unverifiable"}
 
-SET_MD = {"D": SUP_DIR / "set_D_unreviewed_155.md",
-          "E": SUP_DIR / "set_E_recheck_12.md"}
-SET_TEMPLATE = {"D": SUP_DIR / "verdicts_template_D.jsonl",
-                "E": SUP_DIR / "verdicts_template_E.jsonl"}
-SET_OUTPUT = {"D": SUP_DIR / "verdicts_ai_supplementary_D.jsonl",
-              "E": SUP_DIR / "verdicts_ai_recheck_E.jsonl"}
+# 动态发现 set 材料路径（r0 向后兼容，r1+ 支持不同条数）
+SET_MD: dict = {}
+SET_TEMPLATE: dict = {}
+SET_OUTPUT: dict = {}
+_refresh_set_paths(DEFAULT_RC)
 
 OUTPUT_INSTRUCTION = """\
 请对上面材料给出 JSON 判定（只输出 JSON，不输出其他文字）：
@@ -96,7 +143,7 @@ def split_md_sections(md_text: str) -> dict:
     头行必须保留：模型需要从材料中读到 review_id 并在 JSON 中原样返回。
     """
     sections = {}
-    parts = re.split(r"(?m)^### (SR-[DE]-\d{3})\s*$", md_text)
+    parts = re.split(r"(?m)^### ((?:SR|R\d+)-[DE]-\d{3})\s*$", md_text)
     for i in range(1, len(parts), 2):
         rid, body = parts[i], parts[i + 1]
         body = body.strip()
@@ -107,6 +154,8 @@ def split_md_sections(md_text: str) -> dict:
 
 
 def load_templates(set_name: str) -> list:
+    if set_name not in SET_TEMPLATE:
+        return []
     return [json.loads(l) for l in open(SET_TEMPLATE[set_name], encoding="utf-8")]
 
 
@@ -274,6 +323,9 @@ def sha256_text(text: str) -> str:
 
 def run_set(set_name: str, limit=None, parse_retry=DEFAULT_PARSE_RETRY,
             dry_run=False):
+    if set_name not in SET_MD:
+        print(f"[set {set_name}] 材料不存在（可能无 uncertain 需复核），跳过")
+        return {"done": 0, "skipped": 0, "todo": 0}
     guide = (SUP_DIR / "REVIEW_GUIDE.md").read_text(encoding="utf-8")
     sections = split_md_sections((SET_MD[set_name]).read_text(encoding="utf-8"))
     templates = load_templates(set_name)
@@ -351,11 +403,11 @@ def write_metadata(all_stats: dict, args) -> Path:
             (SUP_DIR / "REVIEW_GUIDE.md").read_text(encoding="utf-8")),
         "material_md_sha256": {
             s: sha256_text(SET_MD[s].read_text(encoding="utf-8"))
-            for s in ("D", "E")
+            for s in SET_MD
         },
         "template_sha256": {
             s: sha256_text(SET_TEMPLATE[s].read_text(encoding="utf-8"))
-            for s in ("D", "E")
+            for s in SET_TEMPLATE
         },
         "script_sha256": hashlib.sha256(
             Path(__file__).read_bytes()).hexdigest(),
@@ -382,6 +434,8 @@ def rebuild_metadata() -> Path:
     output_info = {}
     for s in ("D", "E"):
         path = SET_OUTPUT[s]
+        if not path.exists():
+            continue
         rows = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines()
                 if l.strip()]
         templates = load_templates(s)
@@ -420,11 +474,11 @@ def rebuild_metadata() -> Path:
             (SUP_DIR / "REVIEW_GUIDE.md").read_text(encoding="utf-8")),
         "material_md_sha256": {
             s: sha256_text(SET_MD[s].read_text(encoding="utf-8"))
-            for s in ("D", "E")
+            for s in SET_MD
         },
         "template_sha256": {
             s: sha256_text(SET_TEMPLATE[s].read_text(encoding="utf-8"))
-            for s in ("D", "E")
+            for s in SET_TEMPLATE
         },
         "script_sha256": hashlib.sha256(
             Path(__file__).read_bytes()).hexdigest(),
@@ -450,7 +504,20 @@ def main():
     ap.add_argument("--rebuild-metadata", action="store_true",
                     help="离线重建 review_metadata.json（不调模型）：stats 以输出文件"
                          "累计数为准，并记录输出 SHA-256")
+    # repeat-aware 参数
+    ap.add_argument("--data-name", default="neurology_chunk1000")
+    ap.add_argument("--repeat", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--snapshot", default=None,
+                    help="系统快照 ID（默认用 judge_longcat.SNAPSHOT_DEFAULT）")
     args = ap.parse_args()
+
+    # 切换 RepeatContext（非默认 repeat 时生效）
+    rc = RepeatContext.from_args(args)
+    if rc != DEFAULT_RC:
+        set_context(rc)
+        print(f"[repeat] r{rc.repeat}/s{rc.seed}/{rc.snapshot[:8]} "
+              f"-> {rc.supplementary_dir}")
 
     if args.rebuild_metadata:
         meta_path = rebuild_metadata()
@@ -458,15 +525,23 @@ def main():
         return
 
     sets = ["D", "E"] if args.set == "both" else [args.set]
+    # 过滤掉无材料的 set（如 r1+ 无 uncertain 则 E 不存在）
+    available = [s for s in sets if s in SET_MD]
+    missing = [s for s in sets if s not in SET_MD]
+    if missing:
+        print(f"[skip] 以下 set 无材料，跳过: {missing}")
+    if not available:
+        print("无可用 set，退出")
+        return
     all_stats = {}
-    for s in sets:
+    for s in available:
         all_stats[s] = run_set(s, limit=args.limit,
                                parse_retry=args.parse_retry,
                                dry_run=args.dry_run)
     meta_path = write_metadata(all_stats, args)
     print(json.dumps(all_stats, ensure_ascii=False, indent=1))
     print(f"review_metadata.json -> {meta_path}")
-    for s in sets:
+    for s in available:
         n = len(load_existing(s))
         print(f"set {s}: 输出文件现有 {n} 条（{SET_OUTPUT[s].name}）")
 

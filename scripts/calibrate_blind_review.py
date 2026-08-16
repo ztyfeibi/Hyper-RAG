@@ -71,16 +71,32 @@ if sys.stdout.encoding and sys.stdout.encoding.lower().replace("-", "") != "utf8
     except Exception:
         pass
 
+from repeat_context import RepeatContext, DEFAULT_RC  # noqa: E402
+
 # ---------------------------------------------------------------------------
 # 路径 / 运行参数常量
 # ---------------------------------------------------------------------------
+# 模块级常量保持 r0/s42 默认值（向后兼容旧测试与 freeze_judge 导入）。
+# CLI main() 通过 set_context() 切换到非默认 repeat。
+_RC: RepeatContext = DEFAULT_RC
 REPEAT = 0
 SEED = 42
 SNAPSHOT = jl.SNAPSHOT_DEFAULT
-_JUDGE_DIR = _ROOT / jl.LONGCAT_DIR / f"r{REPEAT}_s{SEED}_{SNAPSHOT[:8]}"
-BLIND_DIR = _JUDGE_DIR / "blind_review"
-QUESTIONS_FILE = _ROOT / jl.QUESTIONS_FILE
+_JUDGE_DIR = DEFAULT_RC.judge_dir
+BLIND_DIR = DEFAULT_RC.blind_dir
+QUESTIONS_FILE = jl.QUESTIONS_FILE
 ROUTES = list(jl.ROUTES)
+
+
+def set_context(rc: RepeatContext) -> None:
+    """切换活跃 RepeatContext（CLI main 调用；测试可重置）."""
+    global _RC, REPEAT, SEED, SNAPSHOT, _JUDGE_DIR, BLIND_DIR
+    _RC = rc
+    REPEAT = rc.repeat
+    SEED = rc.seed
+    SNAPSHOT = rc.snapshot
+    _JUDGE_DIR = rc.judge_dir
+    BLIND_DIR = rc.blind_dir
 
 VALID_VERDICTS = {"pass", "fail", "uncertain"}
 VALID_AU_STATUS = {"supported", "missing", "contradicted"}
@@ -160,11 +176,14 @@ def load_sample_manifest() -> dict:
     return json.loads((BLIND_DIR / "sample_manifest.json").read_text(encoding="utf-8"))
 
 
-def load_longcat_verdicts() -> dict[str, dict[str, dict]]:
+def load_longcat_verdicts(judge_dir: Path | None = None,
+                          routes: list[str] | None = None) -> dict[str, dict[str, dict]]:
     """route -> {qid -> best_record}（去重，优先 parse_ok）。"""
+    jd = judge_dir or _RC.judge_dir
+    rts = routes or ROUTES
     out: dict[str, dict[str, dict]] = {}
-    for route in ROUTES:
-        path = _JUDGE_DIR / f"{route}_verdict.jsonl"
+    for route in rts:
+        path = jd / f"{route}_verdict.jsonl"
         if not path.exists():
             continue
         rows = load_jsonl(path)
@@ -523,7 +542,9 @@ def align_records() -> list[dict]:
 # ---------------------------------------------------------------------------
 # 真实 coverage 计算（复用 judge_longcat 同一实现）
 # ---------------------------------------------------------------------------
-def compute_coverage_map(longcat: dict[str, dict[str, dict]] | None = None) -> dict:
+def compute_coverage_map(longcat: dict[str, dict[str, dict]] | None = None,
+                         rc: RepeatContext | None = None,
+                         routes: list[str] | None = None) -> dict:
     """逐 (route, qid) 计算 ER 级 evidence coverage。
 
     规则与 judge_longcat.build_summary 完全一致（同一函数、同一输入文件）：
@@ -533,17 +554,19 @@ def compute_coverage_map(longcat: dict[str, dict[str, dict]] | None = None) -> d
     - context 缺失（is None）记 no_context（coverage_hit=None）
     禁止从 summary 总数反推。
     """
+    ctx = rc or _RC
+    rts = routes or ROUTES
     if longcat is None:
-        longcat = load_longcat_verdicts()
+        longcat = load_longcat_verdicts(ctx.judge_dir, rts)
     spans = jl.load_evidence_spans()
     ers = jl.load_evidence_requirements()
     cov_map: dict[tuple, dict] = {}
-    for route in ROUTES:
+    for route in rts:
         route_map = longcat.get(route, {})
         has_gate = route != "P0"
         contexts = None
         if has_gate:
-            rf = _ROOT / jl.result_file(route, REPEAT, SEED, SNAPSHOT)
+            rf = _ROOT / ctx.result_file(route)
             contexts = jl.load_result_contexts(rf) if rf.exists() else None
         search = "sources" if route in ("P2", "P3", "P4") else "full"
         for qid in route_map:
@@ -559,8 +582,8 @@ def compute_coverage_map(longcat: dict[str, dict[str, dict]] | None = None) -> d
                     "context_hash": None,
                 }
                 continue
-            ctx = contexts.get(qid) if contexts is not None else None
-            if ctx is None:
+            ctx_q = contexts.get(qid) if contexts is not None else None
+            if ctx_q is None:
                 cov_map[(route, qid)] = {
                     "coverage_hit": None,
                     "coverage_rule_version": jl.COVERAGE_RULE_VERSION,
@@ -573,7 +596,7 @@ def compute_coverage_map(longcat: dict[str, dict[str, dict]] | None = None) -> d
                 }
                 continue
             result = jl.calc_source_evidence_coverage(
-                ctx, ers.get(qid, []), spans.get(qid, {}), search=search)
+                ctx_q, ers.get(qid, []), spans.get(qid, {}), search=search)
             total = len(ers.get(qid, []))
             hit = sum(1 for v in result["requirement_hits"].values() if v)
             cov_map[(route, qid)] = {
@@ -584,15 +607,16 @@ def compute_coverage_map(longcat: dict[str, dict[str, dict]] | None = None) -> d
                 "evidence_requirements_hit": hit,
                 "er_recall": result["er_recall"],
                 "coverage_details": result["requirement_hits"],
-                "context_hash": sha256_str(ctx),
+                "context_hash": sha256_str(ctx_q),
             }
     return cov_map
 
 
-def coverage_route_stats(cov_map: dict) -> dict:
+def coverage_route_stats(cov_map: dict, routes: list[str] | None = None) -> dict:
     """按路径统计 coverage（pass/fail/no_context，含 P0 无门槛）。"""
+    rts = routes or ROUTES
     stats = {}
-    for route in ROUTES:
+    for route in rts:
         items = [v for (r, _q), v in cov_map.items() if r == route]
         stats[route] = {
             "n": len(items),
@@ -604,24 +628,41 @@ def coverage_route_stats(cov_map: dict) -> dict:
     return stats
 
 
-def verify_coverage_against_frozen(cov_map: dict) -> list[str]:
-    """逐条复算的全量 coverage 统计必须与冻结 summary 一致，否则 fail-closed。"""
+def verify_coverage_against_frozen(cov_map: dict, repeat: int | None = None,
+                                   routes: list[str] | None = None) -> list[str]:
+    """逐条复算的全量 coverage 统计必须与冻结统计一致，否则 fail-closed。
+
+    r0: 对账 FROZEN_COVERAGE_PASS（内置常量）+ summary.json。
+    r1+: 对账该 repeat 自身 summary.json（自洽，不跨 repeat 比 48/6/24/34/80）。
+    """
+    rpt = repeat if repeat is not None else _RC.repeat
+    rts = routes or ROUTES
     errors = []
-    stats = coverage_route_stats(cov_map)
-    # 与内置冻结常量对账
-    for route, expected in FROZEN_COVERAGE_PASS.items():
-        actual = stats[route]["pass"]
-        if actual != expected:
-            errors.append(f"{route}: 复算 coverage pass={actual} != 冻结 {expected}")
-    # 与 summary.json 对账（若存在）
-    sp = _JUDGE_DIR / "summary.json"
+    stats = coverage_route_stats(cov_map, rts)
+    if rpt == 0:
+        # r0: 与内置冻结常量对账
+        for route in rts:
+            expected = FROZEN_COVERAGE_PASS.get(route)
+            if expected is None:
+                continue
+            actual = stats[route]["pass"]
+            if actual != expected:
+                errors.append(f"{route}: 复算 coverage pass={actual} != 冻结 {expected}")
+    # 所有 repeat: 与 summary.json 对账（若存在）
+    sp = _RC.judge_dir / "summary.json"
     if sp.exists():
         summary = json.loads(sp.read_text(encoding="utf-8"))
-        for route, expected in FROZEN_COVERAGE_PASS.items():
+        for route in rts:
             frozen = summary.get("routes", {}).get(route, {}) \
                 .get("source_evidence_coverage", {}).get("pass")
-            if frozen is not None and frozen != expected:
-                errors.append(f"{route}: 内置冻结常量 {expected} 与 summary.json {frozen} 不一致")
+            if frozen is not None:
+                actual = stats[route]["pass"]
+                if actual != frozen:
+                    errors.append(f"{route}: 复算 pass={actual} != summary.json {frozen}")
+            if rpt == 0:
+                expected = FROZEN_COVERAGE_PASS.get(route)
+                if expected is not None and frozen is not None and frozen != expected:
+                    errors.append(f"{route}: 内置冻结常量 {expected} 与 summary.json {frozen} 不一致")
     return errors
 
 
@@ -1176,22 +1217,37 @@ def load_merged_annotations(path: Path) -> list[dict]:
 
 
 def cmd_apply(args) -> int:
-    """阶段五：真实 coverage + adjudication_rule_v3 生成 480 条最终裁决（fail-closed）。
+    """阶段五：真实 coverage + adjudication_rule_v3 生成最终裁决（fail-closed）。
 
-    两种模式：
-    - 旧模式（无 --annotation-file）：163 条 blind_id 对齐，输出 ai_adjudication_v1
-      （向后兼容，pending 进 pending_supplementary.jsonl 队列）。
-    - 合并模式（--annotation-file + --output-version）：读 318 条合并标注，按
-      (route, question_id) 对齐，输出新目录（已存在默认报错，禁止静默覆盖）；
-      pending 记录进 excluded_records.jsonl 并附 exclusion_reason。
+    四种模式：
+    - blind_id_align_163（旧模式，r0 only）：163 条 blind_id 对齐，输出 ai_adjudication_v1
+    - merged_annotation（--annotation-file）：合并标注按 (route,qid) 对齐，输出 ai_adjudication_v2
+    - no_annotations（--no-annotations）：无标注，全 pending，输出 ai_adjudication_pre
+    - 所有模式支持 --routes 子集（如仅 P_gold → 80 条）
     """
     annotation_file = getattr(args, "annotation_file", None)
     output_version = getattr(args, "output_version", None)
     overwrite = bool(getattr(args, "overwrite", False))
-    merged_mode = annotation_file is not None
-    out_version_name = output_version or "ai_adjudication_v1"
-    out_dir = _JUDGE_DIR / out_version_name
+    no_annotations = bool(getattr(args, "no_annotations", False))
+    routes_arg = getattr(args, "routes", None)
+    active_routes = routes_arg.split(",") if routes_arg else list(ROUTES)
 
+    merged_mode = annotation_file is not None and not no_annotations
+    no_ann_mode = no_annotations
+
+    # 互斥检查
+    if no_annotations and annotation_file:
+        print("ERROR: --no-annotations 与 --annotation-file 互斥", file=sys.stderr)
+        return 1
+
+    if no_ann_mode:
+        out_version_name = output_version or "ai_adjudication_pre"
+    elif merged_mode:
+        out_version_name = output_version or "ai_adjudication_v2"
+    else:
+        out_version_name = output_version or "ai_adjudication_v1"
+
+    out_dir = _RC.judge_dir / out_version_name
     if out_dir.exists() and not overwrite:
         print(f"ERROR: 输出目录已存在: {out_dir}（禁止静默覆盖；"
               f"确认放弃旧产物后加 --overwrite）", file=sys.stderr)
@@ -1210,7 +1266,10 @@ def cmd_apply(args) -> int:
 
     # 1) AI 对齐（fail-closed）
     records163 = None
-    if merged_mode:
+    annotation_provenance = None
+    if no_ann_mode:
+        ai_by_route_qid = {}
+    elif merged_mode:
         try:
             ann_rows = load_merged_annotations(ann_path)
         except AlignError as e:
@@ -1245,11 +1304,11 @@ def cmd_apply(args) -> int:
             for r in records163
         }
 
-    longcat = load_longcat_verdicts()
+    longcat = load_longcat_verdicts(_RC.judge_dir, active_routes)
     questions = load_questions()
 
-    # 标注键必须全部落在 480 条 LongCat 记录内（fail-closed）
-    lc_keys = {(route, qid) for route in ROUTES for qid in longcat.get(route, {})}
+    # 标注键必须全部落在 LongCat 记录内（fail-closed）
+    lc_keys = {(route, qid) for route in active_routes for qid in longcat.get(route, {})}
     orphan = set(ai_by_route_qid) - lc_keys
     if orphan:
         print(f"ERROR: {len(orphan)} 条标注的 (route, question_id) 不在 LongCat 记录中: "
@@ -1257,17 +1316,18 @@ def cmd_apply(args) -> int:
         return 1
 
     # 2) 真实 coverage（逐条复算，与冻结统计对账）
-    cov_map = compute_coverage_map(longcat)
-    cov_errors = verify_coverage_against_frozen(cov_map)
+    cov_map = compute_coverage_map(longcat, _RC, active_routes)
+    cov_errors = verify_coverage_against_frozen(cov_map, _RC.repeat, active_routes)
     if cov_errors:
         print("ERROR: coverage 复算与冻结统计不一致（fail-closed）:", file=sys.stderr)
         for e in cov_errors:
             print(f"  {e}", file=sys.stderr)
         return 1
 
-    # 3) 结构检查：六路径各 80、parse_ok 全 true
+    # 3) 结构检查：每路径各 80、parse_ok 全 true
+    expected_total = 80 * len(active_routes)
     structural_errors = []
-    for route in ROUTES:
+    for route in active_routes:
         route_map = longcat.get(route, {})
         if len(route_map) != 80:
             structural_errors.append(f"{route}: {len(route_map)} 条 != 80")
@@ -1275,16 +1335,17 @@ def cmd_apply(args) -> int:
             if not lc.get("parse_ok"):
                 structural_errors.append(f"{route}/{qid}: parse_ok 非 true")
     if structural_errors:
-        print("ERROR: LongCat 记录结构不满足 480 条约束（fail-closed）:", file=sys.stderr)
+        print(f"ERROR: LongCat 记录结构不满足 {expected_total} 条约束（fail-closed）:",
+              file=sys.stderr)
         for e in structural_errors[:20]:
             print(f"  {e}", file=sys.stderr)
         return 1
 
     # 4) 候选答案（补充审核材料用，仅旧模式队列需要）
     answers_by_route = {}
-    if not merged_mode:
-        for route in ROUTES:
-            rf = _ROOT / jl.result_file(route, REPEAT, SEED, SNAPSHOT)
+    if not merged_mode and not no_ann_mode:
+        for route in active_routes:
+            rf = _ROOT / _RC.result_file(route)
             answers_by_route[route] = jl.load_results(rf) if rf.exists() else {}
 
     final_records = []
@@ -1292,7 +1353,7 @@ def cmd_apply(args) -> int:
     excluded_records = []
     ai_reviewed_pending = 0
 
-    for route in ROUTES:
+    for route in active_routes:
         has_gate = route != "P0"
         for qid in sorted(longcat[route]):
             lc = longcat[route][qid]
@@ -1322,7 +1383,6 @@ def cmd_apply(args) -> int:
                 "answer_correctness": v["answer_correctness"],
                 "route_success": v["route_success"],
                 "adjudication_rule_version": ADJUDICATION_RULE_VERSION,
-                # 真实 coverage 字段（问题一）
                 "coverage_hit": cov["coverage_hit"],
                 "coverage_rule_version": cov["coverage_rule_version"],
                 "no_context": cov["no_context"],
@@ -1331,7 +1391,6 @@ def cmd_apply(args) -> int:
                 "er_recall": cov["er_recall"],
                 "coverage_details": cov["coverage_details"],
                 "context_hash": cov["context_hash"],
-                # 裁决依据
                 "required_aus": v["required_aus"],
                 "has_required_contradicted": v["has_required_contradicted"],
                 "has_required_missing": v["has_required_missing"],
@@ -1343,8 +1402,7 @@ def cmd_apply(args) -> int:
             })
             if v["route_success"] == "pending":
                 if ai_r is None:
-                    if merged_mode:
-                        # 合并模式：pending 不再排队补充审核，直接进排除清单
+                    if merged_mode or no_ann_mode:
                         excluded_records.append({
                             "route": route,
                             "question_id": qid,
@@ -1359,7 +1417,6 @@ def cmd_apply(args) -> int:
                             "has_unresolved_claim": None,
                         })
                     else:
-                        # 补充审核队列：不含 163 条已审核；隐藏 route/blind_id
                         pending_supplementary.append({
                             "question_id": qid,
                             "question": q.get("question", ""),
@@ -1382,8 +1439,7 @@ def cmd_apply(args) -> int:
                         })
                 else:
                     ai_reviewed_pending += 1
-                    if merged_mode:
-                        # 已审核但 unresolved 悬置：uncertain 不强转 pass/fail，进排除清单
+                    if merged_mode or no_ann_mode:
                         excluded_records.append({
                             "route": route,
                             "question_id": qid,
@@ -1398,13 +1454,13 @@ def cmd_apply(args) -> int:
                             "has_unresolved_claim": v["has_unresolved_claim"],
                         })
 
-    # 5) 480 条约束校验
+    # 5) 总数约束校验
     keys = [(r["route"], r["question_id"]) for r in final_records]
-    if len(final_records) != 480 or len(set(keys)) != 480:
-        print(f"ERROR: final_verdicts {len(final_records)} 条 / 唯一键 {len(set(keys))} != 480",
-              file=sys.stderr)
+    if len(final_records) != expected_total or len(set(keys)) != expected_total:
+        print(f"ERROR: final_verdicts {len(final_records)} 条 / 唯一键 {len(set(keys))} "
+              f"!= {expected_total}", file=sys.stderr)
         return 1
-    for route in ROUTES:
+    for route in active_routes:
         n = sum(1 for r in final_records if r["route"] == route)
         if n != 80:
             print(f"ERROR: {route} {n} 条 != 80", file=sys.stderr)
@@ -1425,11 +1481,11 @@ def cmd_apply(args) -> int:
         for r in final_records:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-    cov_stats = coverage_route_stats(cov_map)
+    cov_stats = coverage_route_stats(cov_map, active_routes)
     rs_dist = Counter(r["route_success"] for r in final_records)
     ac_dist = Counter(r["answer_correctness"] for r in final_records)
     by_route = {}
-    for route in ROUTES:
+    for route in active_routes:
         rs = [r for r in final_records if r["route"] == route]
         by_route[route] = {
             "n": len(rs),
@@ -1438,43 +1494,72 @@ def cmd_apply(args) -> int:
             "coverage": {k: cov_stats[route][k] for k in ("pass", "fail", "no_context", "not_gated")},
             "ai_reviewed": sum(1 for r in rs if r["source"] == "ai_review"),
         }
+
+    if no_ann_mode:
+        apply_mode_str = "no_annotations"
+    elif merged_mode:
+        apply_mode_str = "merged_annotation"
+    else:
+        apply_mode_str = "blind_id_align_163"
+
     summary_out = {
         "adjudication_rule_version": ADJUDICATION_RULE_VERSION,
         "coverage_rule_version": jl.COVERAGE_RULE_VERSION,
-        "apply_mode": "merged_annotation" if merged_mode else "blind_id_align_163",
+        "apply_mode": apply_mode_str,
         "output_version": out_version_name,
+        "repeat": _RC.repeat,
+        "seed": _RC.seed,
+        "routes": active_routes,
         "total_records": len(final_records),
         "route_success_dist": dict(rs_dist),
         "answer_correctness_dist": dict(ac_dist),
         "by_route": by_route,
-        "ai_annotated_records": len(records163) if records163 is not None else len(ai_by_route_qid),
+        "ai_annotated_records": len(ai_by_route_qid),
         "ai_reviewed_pending": ai_reviewed_pending,
-        "coverage_frozen_check": {
-            "expected_pass": FROZEN_COVERAGE_PASS,
-            "recomputed_pass": {r: cov_stats[r]["pass"] for r in FROZEN_COVERAGE_PASS},
-            "match": True,
-        },
     }
+    if _RC.repeat == 0:
+        # r0 契约字段（与冻结 ai_adjudication_v1/v2 schema 逐字节兼容，禁止改动）
+        summary_out["coverage_frozen_check"] = {
+            "expected_pass": FROZEN_COVERAGE_PASS,
+            "recomputed_pass": {r: cov_stats[r]["pass"]
+                                for r in FROZEN_COVERAGE_PASS if r in cov_stats},
+            "match": True,
+        }
+    else:
+        # r1+: 无跨 repeat 冻结常量，与自身 summary.json 自洽对账
+        summary_out["coverage_check"] = {
+            "repeat": _RC.repeat,
+            "routes": {r: cov_stats[r]["pass"] for r in active_routes},
+            "frozen_match": True,
+        }
     if merged_mode:
         pgold = [r for r in final_records if r["route"] == "P_gold"]
         pgold_dist = Counter(r["route_success"] for r in pgold)
         summary_out.update({
             "annotation_file": ann_path.name,
             "annotation_count": len(ai_by_route_qid),
-            "unreviewed_count": 480 - ai_reviewed_total,
+            "unreviewed_count": expected_total - ai_reviewed_total,
             "excluded_count": len(excluded_records),
             "exclusion_reason_dist": dict(Counter(r["exclusion_reason"]
                                                   for r in excluded_records)),
             "P_gold_route_success": {k: pgold_dist.get(k, 0)
                                      for k in ("pass", "fail", "pending")},
-            "note": ("合并标注 apply：318 条 AI 审核按 (route, question_id) 对齐；"
-                     "未审核 162 条 coverage 硬失败记 route_success=fail；"
-                     "uncertain/unresolved 不强转 pass-fail，进 excluded_records.jsonl"),
+        })
+    elif no_ann_mode:
+        pgold = [r for r in final_records if r["route"] == "P_gold"]
+        pgold_dist = Counter(r["route_success"] for r in pgold)
+        summary_out.update({
+            "annotation_count": 0,
+            "excluded_count": len(excluded_records),
+            "exclusion_reason_dist": dict(Counter(r["exclusion_reason"]
+                                                  for r in excluded_records)),
+            "P_gold_route_success": {k: pgold_dist.get(k, 0)
+                                     for k in ("pass", "fail", "pending")},
         })
     fs_path = out_dir / "final_summary.json"
     fs_path.write_text(json.dumps(summary_out, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    if merged_mode:
+    if merged_mode or no_ann_mode:
         ex_path = out_dir / "excluded_records.jsonl"
         with open(ex_path, "w", encoding="utf-8") as f:
             for r in excluded_records:
@@ -1488,21 +1573,24 @@ def cmd_apply(args) -> int:
     # 7) manifest（全量 SHA-256 溯源）
     input_hashes = {
         "questions_file": sha256_file(QUESTIONS_FILE),
-        "ai_annotated_v1": sha256_file(BLIND_DIR / ANN_V1),
-        "ai_annotated_v2": sha256_file(BLIND_DIR / ANN_V2),
-        "sample_manifest": sha256_file(BLIND_DIR / "sample_manifest.json"),
-        "judge_summary": sha256_file(_JUDGE_DIR / "summary.json"),
-        "longcat_verdicts": {route: sha256_file(_JUDGE_DIR / f"{route}_verdict.jsonl")
-                             for route in ROUTES},
+        "judge_summary": sha256_file(_RC.judge_dir / "summary.json") if (_RC.judge_dir / "summary.json").exists() else None,
+        "longcat_verdicts": {route: sha256_file(_RC.verdict_file(route))
+                             for route in active_routes
+                             if _RC.verdict_file(route).exists()},
         "result_files": {
-            route: sha256_file(_ROOT / jl.result_file(route, REPEAT, SEED, SNAPSHOT))
-            for route in ROUTES
+            route: sha256_file(_ROOT / _RC.result_file(route))
+            for route in active_routes
+            if (_ROOT / _RC.result_file(route)).exists()
         },
     }
+    if not no_ann_mode and not merged_mode:
+        # r0 blind_id mode: record annotation hashes
+        input_hashes["ai_annotated_v1"] = sha256_file(BLIND_DIR / ANN_V1) if (BLIND_DIR / ANN_V1).exists() else None
+        input_hashes["ai_annotated_v2"] = sha256_file(BLIND_DIR / ANN_V2) if (BLIND_DIR / ANN_V2).exists() else None
+        input_hashes["sample_manifest"] = sha256_file(BLIND_DIR / "sample_manifest.json") if (BLIND_DIR / "sample_manifest.json").exists() else None
     if merged_mode:
         input_hashes["annotation_file"] = sha256_file(ann_path)
         ann_meta_path = ann_path.parent / "review_metadata.json"
-        annotation_provenance = None
         if ann_meta_path.exists():
             am = json.loads(ann_meta_path.read_text(encoding="utf-8"))
             annotation_provenance = {
@@ -1511,32 +1599,33 @@ def cmd_apply(args) -> int:
                 "review_model": am.get("review_model"),
                 "review_provider": am.get("review_provider"),
                 "review_temperature": am.get("review_temperature"),
-                "note": ("仅覆盖 set_D(155)/set_E(12) 补充审核溯源；"
-                         "原 163 条标注的审核模型不在本 manifest 声明范围（CLI 未提供则 unknown）"),
             }
     provenance = _provenance(args)
     manifest_out = {
         "adjudication_rule_version": ADJUDICATION_RULE_VERSION,
         "coverage_rule_version": jl.COVERAGE_RULE_VERSION,
-        "apply_mode": "merged_annotation" if merged_mode else "blind_id_align_163",
+        "apply_mode": apply_mode_str,
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "repeat": REPEAT, "seed": SEED, "snapshot": SNAPSHOT,
+        "repeat": _RC.repeat, "seed": _RC.seed, "snapshot": _RC.snapshot,
+        "routes": active_routes,
         "counts": {
             "total_records": len(final_records),
-            "per_route": {route: 80 for route in ROUTES},
-            "ai_annotated": len(records163) if records163 is not None else len(ai_by_route_qid),
+            "per_route": {route: 80 for route in active_routes},
+            "ai_annotated": len(ai_by_route_qid),
             "ai_reviewed_pending": ai_reviewed_pending,
-            "unreviewed": 480 - ai_reviewed_total,
-            "excluded": len(excluded_records) if merged_mode else None,
-            "pending_supplementary": len(pending_supplementary) if not merged_mode else None,
+            "unreviewed": expected_total - ai_reviewed_total,
+            "excluded": len(excluded_records) if (merged_mode or no_ann_mode) else None,
+            "pending_supplementary": len(pending_supplementary) if not (merged_mode or no_ann_mode) else None,
         },
         "coverage_recomputation": {
-            "method": "judge_longcat.calc_source_evidence_coverage 逐条复算（P2-P4 sources 区段，P1/P_gold 全文，P0 无门槛）",
+            "method": "judge_longcat.calc_source_evidence_coverage 逐条复算",
             "frozen_match": True,
-            "expected_pass": FROZEN_COVERAGE_PASS,
+            "repeat": _RC.repeat,
+            "routes": {r: cov_stats[r]["pass"] for r in active_routes},
+            **({"expected_pass": FROZEN_COVERAGE_PASS} if _RC.repeat == 0 else {}),
         },
         "provenance": provenance,
-        "annotation_provenance": annotation_provenance if merged_mode else None,
+        "annotation_provenance": annotation_provenance,
         "claim_fatality_derivation": {
             "claim_mapping": dict(CLAIM_FATALITY_MAP),
             "record_priority": list(RECORD_FATALITY_PRIORITY),
@@ -1547,7 +1636,7 @@ def cmd_apply(args) -> int:
         "input_sha256": input_hashes,
         "note": "final_verdicts.jsonl 不覆盖原始 LongCat 判定；原始数据保留在 *_verdict.jsonl",
     }
-    if merged_mode:
+    if merged_mode or no_ann_mode:
         manifest_out["output_sha256"] = {
             "final_verdicts.jsonl": sha256_file(fv_path),
             "final_summary.json": sha256_file(fs_path),
@@ -1563,18 +1652,16 @@ def cmd_apply(args) -> int:
         json.dumps(manifest_out, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print(f"最终裁决已生成: {out_dir}/")
-    print(f"  final_verdicts.jsonl: {len(final_records)} 条（六路径各 80，(route,qid) 唯一）")
-    print(f"  final_summary.json")
-    if merged_mode:
-        print(f"  excluded_records.jsonl: {len(excluded_records)} 条"
-              f"（route_success=pending 全量，含 exclusion_reason）")
-        print(f"  manifest.json（全量 SHA-256，标注 {len(ai_by_route_qid)} 条 + "
-              f"未审核 {480 - ai_reviewed_total} 条）")
-        print(f"  P_gold route_success: {summary_out['P_gold_route_success']}")
+    print(f"  final_verdicts.jsonl: {len(final_records)} 条（{len(active_routes)} 路径各 80）")
+    print(f"  apply_mode: {apply_mode_str}")
+    if merged_mode or no_ann_mode:
+        print(f"  excluded_records.jsonl: {len(excluded_records)} 条")
+        print(f"  annotation_count: {len(ai_by_route_qid)}")
     else:
-        print(f"  pending_supplementary.jsonl: {len(pending_supplementary)} 条（不含已审核 163 条，隐藏 route）")
-        print(f"  manifest.json（全量 SHA-256）")
-    print(f"  coverage 复算与冻结统计一致: {FROZEN_COVERAGE_PASS}")
+        print(f"  pending_supplementary.jsonl: {len(pending_supplementary)} 条")
+    if "P_gold" in active_routes:
+        pg = summary_out.get("P_gold_route_success", {})
+        print(f"  P_gold route_success: {pg}")
     print(f"  已审核但仍 pending（unresolved 悬置）: {ai_reviewed_pending} 条")
     return 0
 
@@ -1628,9 +1715,21 @@ def main():
     parser = argparse.ArgumentParser(description="盲审校准脚本（validate / report / apply）")
     parser.add_argument("--mode", required=True, choices=["validate", "report", "apply"],
                         help="运行模式: validate(校验+v2派生) / report(指标) / apply(最终裁决)")
+    # repeat-aware 参数
+    parser.add_argument("--data-name", default="neurology_chunk1000")
+    parser.add_argument("--repeat", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--snapshot", default=None,
+                        help="系统快照 ID（默认 jl.SNAPSHOT_DEFAULT）")
+    parser.add_argument("--routes", default=None,
+                        help="路由子集（逗号分隔，如 P_gold）；默认全部 6 路径")
+    # apply 模式
     parser.add_argument("--annotation-file", default=None,
                         help="apply 模式：合并后的 AI 标注文件（如 verdicts_ai_all_v1.jsonl，"
                              "须含 route + question_id，按键对齐；不传则走旧 163 条 blind_id 对齐）")
+    parser.add_argument("--no-annotations", action="store_true",
+                        help="apply 模式：无标注（新 repeat 初次 apply）；"
+                             "与 --annotation-file 互斥；输出 ai_adjudication_pre/")
     parser.add_argument("--output-version", default=None,
                         help="apply 模式：输出目录名（如 ai_adjudication_v2）；"
                              "目录已存在时默认报错，禁止静默覆盖")
@@ -1648,6 +1747,15 @@ def main():
     parser.add_argument("--annotation-type", default=None,
                         help="标注类型（如 independent_ai_review）；无法证明则不传")
     args = parser.parse_args()
+
+    # 切换 RepeatContext
+    rc = RepeatContext(
+        data_name=args.data_name,
+        repeat=args.repeat,
+        seed=args.seed,
+        snapshot=args.snapshot or jl.SNAPSHOT_DEFAULT,
+    )
+    set_context(rc)
 
     if args.mode == "validate":
         return cmd_validate(args)

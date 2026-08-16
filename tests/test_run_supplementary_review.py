@@ -15,8 +15,8 @@ import run_supplementary_review as rsr  # noqa: E402
 
 @pytest.fixture(scope="module")
 def materials():
-    d_md = rsr.SUP_DIR / "set_D_unreviewed_155.md"
-    e_md = rsr.SUP_DIR / "set_E_recheck_12.md"
+    d_md = rsr.SET_MD["D"]
+    e_md = rsr.SET_MD["E"]
     return {
         "d_sections": rsr.split_md_sections(d_md.read_text(encoding="utf-8")),
         "e_sections": rsr.split_md_sections(e_md.read_text(encoding="utf-8")),

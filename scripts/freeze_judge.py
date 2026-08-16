@@ -27,8 +27,42 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-import judge_longcat as jl
-import calibrate_blind_review as cal
+
+def _import_judge_longcat():
+    """导入 judge_longcat（只读常量/路径，不发 LLM 请求）。
+
+    judge_longcat 的 import 链会拉起 hyperrag（aioboto3 等重依赖）——
+    可导入则用真实模块，否则注入轻量 stub（与 calibrate_blind_review 同方案）。
+    """
+    import importlib
+    import types
+
+    def _stub(name: str, **attrs):
+        try:
+            importlib.import_module(name)
+        except Exception:
+            mod = types.ModuleType(name)
+            for k, v in attrs.items():
+                setattr(mod, k, v)
+            sys.modules[name] = mod
+
+    _stub("openai", OpenAI=object)
+    if "hyperrag" not in sys.modules:
+        try:
+            importlib.import_module("hyperrag")
+        except Exception:
+            pkg = types.ModuleType("hyperrag")
+            pkg.__path__ = []
+            env = types.ModuleType("hyperrag.env")
+            env.normalize_proxy_env = lambda *a, **k: None
+            pkg.env = env
+            sys.modules["hyperrag"] = pkg
+            sys.modules["hyperrag.env"] = env
+    return importlib.import_module("judge_longcat")
+
+
+jl = _import_judge_longcat()
+import calibrate_blind_review as cal  # noqa: E402
 
 REPEAT = 0
 SEED = 42
@@ -45,7 +79,10 @@ ELIG = JUDGE_DIR / "repeat0_question_eligibility.jsonl"
 ELIG_SUM = JUDGE_DIR / "repeat0_eligibility_summary.json"
 OUT = JUDGE_DIR / "judge_freeze_manifest.json"
 
-FREEZE_VERSION = "v1.1"
+FREEZE_VERSION = "v1.2"
+
+# v1.1 归档文件（不参与校验，仅溯源）
+ARCHIVE_V11 = JUDGE_DIR / "judge_freeze_manifest_v1.1.json"
 
 # docs/judge_adjudication_log.md §2 记录的 ai_adjudication_v1 原版哈希前缀
 V1_LOG_HASH_PREFIXES = {
@@ -133,6 +170,17 @@ def current_hash_view() -> dict:
             "build_repeat0_eligibility.py": sha256_file(
                 Path(__file__).resolve().parent / "build_repeat0_eligibility.py"),
             "freeze_judge.py": sha256_file(Path(__file__).resolve()),
+            # v1.2: repeat-aware 流水线脚本纳入冻结范围
+            "repeat_context.py": sha256_file(
+                Path(__file__).resolve().parent / "repeat_context.py"),
+            "run_repeat_pipeline.py": sha256_file(
+                Path(__file__).resolve().parent / "run_repeat_pipeline.py"),
+            "build_supplementary_review.py": sha256_file(
+                Path(__file__).resolve().parent / "build_supplementary_review.py"),
+            "run_supplementary_review.py": sha256_file(
+                Path(__file__).resolve().parent / "run_supplementary_review.py"),
+            "merge_supplementary_verdicts.py": sha256_file(
+                Path(__file__).resolve().parent / "merge_supplementary_verdicts.py"),
         },
     }
 
@@ -246,6 +294,7 @@ def cmd_verify() -> int:
             problems.append(f"{name}: 文件缺失 {p}")
 
     # 身份字段：与 judge manifest / v2 manifest / review_metadata 重读值对账
+    jm = v2m = rm = None
     try:
         jm = json.loads((JUDGE_DIR / "manifest.json").read_text(encoding="utf-8"))
         v2m = json.loads((JUDGE_DIR / "ai_adjudication_v2" / "manifest.json").read_text(
@@ -285,9 +334,10 @@ def cmd_verify() -> int:
     except (OSError, json.JSONDecodeError, KeyError) as e:
         problems.append(f"身份字段对账失败（上游 manifest 读取异常）: {e}")
 
-    # 原版 v1 哈希 + guide 对账（与冻结时同一规则）
+    # 原版 v1 哈希 + guide 对账（与冻结时同一规则；rm 读取失败时跳过 guide 字段对账）
     problems.extend(v1_prefix_problems())
-    problems.extend(guide_problems(rm))
+    if rm is not None:
+        problems.extend(guide_problems(rm))
     sr = manifest.get("supplementary_review", {})
     guide_actual = sha256_guide(REVIEW_GUIDE) if REVIEW_GUIDE.exists() else "<缺失>"
     if sr.get("guide_sha256") != guide_actual:

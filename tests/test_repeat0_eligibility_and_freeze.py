@@ -103,7 +103,7 @@ class TestFreeze:
         assert freeze["input_sha256"]["eligibility"] == fz.sha256_file(fz.ELIG)
 
     def test_freeze_version(self, freeze):
-        assert freeze["freeze_version"] == "v1.1"
+        assert freeze["freeze_version"] == fz.FREEZE_VERSION  # v1.2（repeat-aware 流水线冻结）
 
     def test_guide_sha256_not_null(self, freeze):
         g = freeze["supplementary_review"]["guide_sha256"]
