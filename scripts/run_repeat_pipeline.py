@@ -160,6 +160,10 @@ def build_steps(rc: RepeatContext, routes: list[str],
             "--repeat-id", str(rc.repeat),
             "--seed", str(rc.seed),
             "--system-snapshot", rc.snapshot,
+            # 显式锁定题集文件路径（80 题 questions_v2_manual_final.jsonl），
+            # 否则 Step_3 回退到 --question-stage 默认 2_stage.json（43 题旧文件），
+            # 与冻结 SHA b1067566 不符会被 --expected-question-sha256 门禁拒绝。
+            "--question-file-path", str(jl.QUESTIONS_FILE),
             "--disable-llm-cache", "--save-trace", "--validate-trace",
             "--expected-question-sha256", questions_sha,
         ]

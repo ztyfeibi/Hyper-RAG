@@ -173,6 +173,8 @@ def test_pgold_command_constraints():
     assert "--save-trace" in joined
     assert "--validate-trace" in joined
     assert "--expected-question-sha256" in joined
+    assert "--question-file-path" in joined, "必须显式锁定题集文件，否则 Step_3 回退到 2_stage.json"
+    assert str(rrp.jl.QUESTIONS_FILE) in joined, "题集文件路径必须是冻结的 questions_v2_manual_final.jsonl"
     assert "--debug-relax-constraints" not in joined
     assert f"--repeat-id 1" in joined and "--seed 43" in joined
     assert SNAP in joined
@@ -183,6 +185,8 @@ def test_non_pgold_no_gold_context_arg():
     steps = rrp.build_steps(rc, ["P0", "P_gold"], QUESTIONS_SHA)
     gen_p0 = [s for s in steps if s.name == "generate[P0]"][0]
     assert "--gold-context-file" not in " ".join(gen_p0.cmd)
+    # 非 P_gold 路由也必须显式锁定题集文件（共用 80 题冻结题集）
+    assert "--question-file-path" in " ".join(gen_p0.cmd)
 
 
 # ---------------------------------------------------------------------------
