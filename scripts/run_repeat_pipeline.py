@@ -311,7 +311,7 @@ def report(rc: RepeatContext, routes: list[str]) -> None:
     fs_path = rc.judge_dir / "ai_adjudication_v2" / "final_summary.json"
     print("=" * 70)
     print(f"[report] repeat={rc.repeat} seed={rc.seed} snapshot={rc.snapshot[:8]}")
-    print(f"[report] judge_dir: {rc.judge_dir.relative_to(_ROOT)}")
+    print(f"[report] judge_dir: {_rel(rc.judge_dir)}")
     if fs_path.exists():
         s = json.loads(fs_path.read_text(encoding="utf-8"))
         print(f"[report] total={s.get('total_records')} "
