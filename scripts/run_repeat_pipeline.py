@@ -194,7 +194,7 @@ def build_steps(rc: RepeatContext, routes: list[str],
     steps.append(Step(
         "preapply",
         _py("scripts/calibrate_blind_review.py")
-        + ["--mode", "apply", "--no-annotations", "--routes", routes_csv]
+        + ["--mode", "apply", "--no-annotations", "--overwrite", "--routes", routes_csv]
         + repeat_args,
         marker=rc.judge_dir / "ai_adjudication_pre" / "final_verdicts.jsonl",
         description="no-annotations 初裁（全 pending，输出 ai_adjudication_pre）",
@@ -241,7 +241,7 @@ def build_steps(rc: RepeatContext, routes: list[str],
         "final-apply",
         _py("scripts/calibrate_blind_review.py")
         + ["--mode", "apply", "--annotation-file", str(merged_out),
-           "--output-version", "ai_adjudication_v2", "--routes", routes_csv]
+           "--output-version", "ai_adjudication_v2", "--overwrite", "--routes", routes_csv]
         + repeat_args,
         marker=rc.judge_dir / "ai_adjudication_v2" / "final_verdicts.jsonl",
         description="应用合并标注生成最终裁决 ai_adjudication_v2",
