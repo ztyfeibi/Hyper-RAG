@@ -98,35 +98,8 @@ class TestNormalizeRecord:
 
     def test_normalize_zero_claims(self, materials):
         tpl = next(t for t in materials["d_tpl"] if not t["unsupported_claims"])
-        au = rsr.extract_au_ids(materials["d_sections"][tpl["review_id"]])
-        out = rsr.normalize_record(_valid_record(tpl, au), tpl)
-        assert out["unsupported_claims"] == []
-
-
-def _cids(tpl):
-    return [f"C{i}" for i in range(1, len(tpl["unsupported_claims"]) + 1)]
-
-
-class TestNormalizeRecord:
-    def test_normalize_maps_ids_to_original_text(self, materials):
-        tpl = next(t for t in materials["d_tpl"] if t["unsupported_claims"])
-        au = rsr.extract_au_ids(materials["d_sections"][tpl["review_id"]])
-        raw = _valid_record(tpl, au)
-        raw["claim_status_by_id"]["C1"] = "contradicted"
-        raw["additional_claims"] = [{"claim": "extra stmt", "status": "unverifiable"}]
-        out = rsr.normalize_record(raw, tpl)
-        claims = out["unsupported_claims"]
-        assert claims[0]["claim"] == tpl["unsupported_claims"][0]["claim"]
-        assert claims[0]["status"] == "contradicted"
-        assert claims[0]["claim_id"] == "C1" and claims[0]["prefilled"] is True
-        assert claims[-1] == {"claim": "extra stmt", "status": "unverifiable",
-                              "claim_id": None, "prefilled": False}
-        assert out["response_schema"] == "claim_id_v2"
-        assert out["review_id"] == tpl["review_id"]
-
-    def test_normalize_zero_claims(self, materials):
-        tpl = next(t for t in materials["d_tpl"] if not t["unsupported_claims"])
-        au = rsr.extract_au_ids(materials["d_sections"][tpl["review_id"]])
+        au = rsr.extract_au_ids(materials["e_sections" if tpl["review_id"].startswith("SR-E")
+                                else "d_sections"][tpl["review_id"]])
         out = rsr.normalize_record(_valid_record(tpl, au), tpl)
         assert out["unsupported_claims"] == []
 
@@ -270,11 +243,22 @@ class TestRunSet:
 
 class TestMetadata:
     def test_write_metadata_fields(self, tmp_path, monkeypatch, materials):
+        # 隔离：write_metadata 输出到 tmp（禁止写真实 SUP_DIR/review_metadata.json），
+        # 只复制 REVIEW_GUIDE.md 供 prompt_guide_sha256 计算。
+        sup = tmp_path / "sup"
+        sup.mkdir()
+        (sup / "REVIEW_GUIDE.md").write_bytes(
+            (rsr.SUP_DIR / "REVIEW_GUIDE.md").read_bytes())
+        real_meta = rsr.SUP_DIR / "review_metadata.json"
+        before = real_meta.read_bytes()
+        monkeypatch.setattr(rsr, "SUP_DIR", sup)
+
         class A:
             set = "both"
             limit = None
             parse_retry = 3
         meta_path = rsr.write_metadata({"D": {"done": 3}, "E": {"done": 1}}, A())
+        assert meta_path == sup / "review_metadata.json"
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         assert meta["review_model"]  # 当前配置 qwen-27b-int4（本地）
         assert meta["review_temperature"] == 0.0
@@ -286,6 +270,8 @@ class TestMetadata:
         assert set(meta["template_sha256"]) == {"D", "E"}
         assert len(meta["script_sha256"]) == 64
         assert meta["stats"] == {"D": {"done": 3}, "E": {"done": 1}}
+        # 真实 metadata 未被触碰（冻结产物保护）
+        assert real_meta.read_bytes() == before
 
 
 class TestRebuildMetadata:
@@ -342,15 +328,36 @@ class TestRebuildMetadata:
                 rsr.SET_OUTPUT[s].read_bytes()).hexdigest()
         assert meta["rebuilt_offline"] is True
 
-    def test_rebuild_real_outputs(self):
-        """真实产物离线重建：D=155 / E=12，todo=0。"""
+    def test_rebuild_real_outputs(self, tmp_path, monkeypatch):
+        """真实产物离线重建（隔离副本）：D=155 / E=12，todo=0；不得写真实 metadata。"""
+        sup = tmp_path / "sup"
+        sup.mkdir()
+        (sup / "REVIEW_GUIDE.md").write_bytes(
+            (rsr.SUP_DIR / "REVIEW_GUIDE.md").read_bytes())
+        set_md, set_tpl, set_out = {}, {}, {}
+        for s in ("D", "E"):
+            for src in (rsr.SET_MD[s], rsr.SET_TEMPLATE[s], rsr.SET_OUTPUT[s]):
+                (sup / src.name).write_bytes(src.read_bytes())
+            set_md[s] = sup / rsr.SET_MD[s].name
+            set_tpl[s] = sup / rsr.SET_TEMPLATE[s].name
+            set_out[s] = sup / rsr.SET_OUTPUT[s].name
+        real_meta = rsr.SUP_DIR / "review_metadata.json"
+        before = real_meta.read_bytes()
+        monkeypatch.setattr(rsr, "SUP_DIR", sup)
+        monkeypatch.setattr(rsr, "SET_MD", set_md)
+        monkeypatch.setattr(rsr, "SET_TEMPLATE", set_tpl)
+        monkeypatch.setattr(rsr, "SET_OUTPUT", set_out)
+
         meta_path = rsr.rebuild_metadata()
+        assert meta_path == sup / "review_metadata.json"
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         assert meta["stats"]["D"]["done"] == 155
         assert meta["stats"]["E"]["done"] == 12
         assert meta["stats"]["D"]["todo"] == 0
         assert meta["stats"]["E"]["todo"] == 0
         assert meta["stats"]["D"]["response_schema_dist"]["claim_id_v2"] == 135
+        # 真实 metadata 未被触碰（冻结产物保护）
+        assert real_meta.read_bytes() == before
 
     def test_rebuild_rejects_duplicate_ids(self, tmp_path, monkeypatch):
         self._setup_fake_sup(tmp_path, monkeypatch, dup=True)

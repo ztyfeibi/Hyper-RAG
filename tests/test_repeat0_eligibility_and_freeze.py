@@ -102,7 +102,47 @@ class TestFreeze:
         assert freeze["input_sha256"]["annotation_all_v1"] == fz.sha256_file(fz.ANN_ALL)
         assert freeze["input_sha256"]["eligibility"] == fz.sha256_file(fz.ELIG)
 
+    def test_freeze_version(self, freeze):
+        assert freeze["freeze_version"] == "v1.1"
+
+    def test_guide_sha256_not_null(self, freeze):
+        g = freeze["supplementary_review"]["guide_sha256"]
+        assert g is not None
+        assert isinstance(g, str) and len(g) == 64
+
+    def test_guide_sha256_matches_file(self, freeze):
+        # 与 run_supplementary_review 的 prompt_guide_sha256 同口径（read_text LF 归一）
+        assert freeze["supplementary_review"]["guide_sha256"] == fz.sha256_guide(fz.REVIEW_GUIDE)
+
     def test_refuses_overwrite(self, monkeypatch):
         monkeypatch.setattr(sys, "argv", ["freeze_judge.py"])
         rc = fz.main()
         assert rc == 1, "已存在的 freeze manifest 禁止静默覆盖"
+
+
+class TestFreezeVerify:
+    def test_verify_passes_unchanged(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "argv", ["freeze_judge.py", "--verify"])
+        assert fz.main() == 0
+        assert "Judge freeze verification: PASS" in capsys.readouterr().out
+
+    def test_verify_detects_tampered_input(self, monkeypatch, tmp_path, capsys):
+        fake = tmp_path / "questions_tampered.jsonl"
+        fake.write_text('{"tampered": true}\n', encoding="utf-8")
+        monkeypatch.setattr(fz, "QUESTIONS_FILE", fake)
+        monkeypatch.setattr(sys, "argv", ["freeze_judge.py", "--verify"])
+        assert fz.main() == 1
+        captured = capsys.readouterr()
+        assert "questions_file" in (captured.out + captured.err)
+
+    def test_verify_does_not_rewrite_manifest(self, monkeypatch):
+        before = fz.sha256_file(fz.OUT)
+        monkeypatch.setattr(sys, "argv", ["freeze_judge.py", "--verify"])
+        assert fz.main() == 0
+        assert fz.sha256_file(fz.OUT) == before, "--verify 必须只读，不得改写 manifest"
+
+    def test_verify_mutually_exclusive_with_overwrite(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", ["freeze_judge.py", "--verify", "--overwrite"])
+        with pytest.raises(SystemExit) as e:
+            fz.main()
+        assert e.value.code == 2
