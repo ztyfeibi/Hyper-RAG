@@ -9,7 +9,8 @@
   - P_gold 强约束：禁止 --max-questions；必须 --gold-context-file、
     --disable-llm-cache、--save-trace、--validate-trace、--expected-question-sha256。
   - 所有子步骤 subprocess.run(check=True)，失败即中止（不继续后续步骤）。
-  - --dry-run 只打印命令不执行；--resume 跳过产物已存在的步骤。
+  - --dry-run 只打印命令不执行；--resume 跳过“产物已覆盖全部请求路线”的步骤
+    （单文件存在但只覆盖部分路线时不跳过，确保 P_gold-only 扩展到六路径会重跑合并裁决）。
 
 11 步固定顺序：
   1  preflight     freeze verify + 题集/gold 数量与哈希门禁（零写盘）
@@ -336,6 +337,66 @@ def _rel(p: Path) -> str:
         return str(p)
 
 
+def _combined_route_counts(path: Path) -> dict:
+    """读取 combined 裁决 JSONL（含 route 字段），返回 {route: 条数}。不存在返回 {}。"""
+    counts: dict[str, int] = {}
+    if not path.exists():
+        return counts
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        rt = r.get("route")
+        if rt:
+            counts[rt] = counts.get(rt, 0) + 1
+    return counts
+
+
+def _covers_routes(rc: RepeatContext, routes: list[str], path: Path) -> bool:
+    """path 是 combined 裁决 JSONL；是否覆盖全部请求路线（每路线恰好 80 条）。"""
+    if not path.exists():
+        return False
+    counts = _combined_route_counts(path)
+    return all(counts.get(r, 0) == P_GOLD_N_QUESTIONS for r in routes)
+
+
+def _judge_covers(rc: RepeatContext, routes: list[str]) -> bool:
+    """所有请求路线的 judge verdict 文件存在且各含 80 条 parse_ok 记录。"""
+    for r in routes:
+        vf = rc.verdict_file(r)
+        if not vf.exists():
+            return False
+        done = jl.read_done_ok(vf)
+        if len(done) != P_GOLD_N_QUESTIONS:
+            return False
+    return True
+
+
+# 这些步骤的输出是“覆盖全部请求路线的合并产物”，resume 必须以路线覆盖度为判据，
+# 而非单文件存在——否则从 P_gold-only 扩展到六路径时会错误跳过，只产出 80 条。
+_ROUTE_AWARE_COMBINED = {"preapply", "final-apply", "review", "merge"}
+
+
+def _should_skip(step: Step, rc: RepeatContext, routes: list[str]) -> bool:
+    """--resume 时该步骤是否可跳过。
+
+    - 无 marker（preflight/verify/report）：从不跳过。
+    - judge：所有请求路线 verdict 完整才跳过（per-route 文件，增量可重跑）。
+    - 合并裁决步骤（preapply/final-apply/review/merge）：输出覆盖全部请求路线才跳过。
+    - 其余（generate[route] 每路径单文件 / build-review / recheck）：单文件存在即跳过。
+    """
+    if step.marker is None:
+        return False
+    if step.name == "judge":
+        return _judge_covers(rc, routes)
+    if step.name in _ROUTE_AWARE_COMBINED:
+        return _covers_routes(rc, routes, step.marker)
+    return step.marker.exists()
+
+
 def run_pipeline(steps: list[Step], rc: RepeatContext, routes: list[str],
                  phase: str = "all", dry_run: bool = False,
                  resume: bool = False, questions_sha: str = QUESTIONS_SHA256,
@@ -367,9 +428,11 @@ def run_pipeline(steps: list[Step], rc: RepeatContext, routes: list[str],
                 return 1
             continue
 
-        # resume：产物已存在则跳过（preflight/verify/report 每次都跑）
-        if resume and step.marker is not None and step.marker.exists():
-            print(f"[skip] {step.name}: 产物已存在 {_rel(step.marker)}")
+        # resume：仅当产物覆盖全部请求路线时跳过（防止 P_gold-only 扩展到六路径时
+        # 错误跳过 preapply/final-apply 等合并步骤，导致最终只 80 条而非 480）。
+        if resume and _should_skip(step, rc, routes):
+            tag = _rel(step.marker) if step.marker else step.name
+            print(f"[skip] {step.name}: 产物已覆盖全部请求路线 {tag}")
             continue
 
         # recheck：E 材料不存在则跳过（第一次审核无 uncertain 属正常）
