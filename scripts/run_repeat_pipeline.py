@@ -160,6 +160,10 @@ def build_steps(rc: RepeatContext, routes: list[str],
             "--repeat-id", str(rc.repeat),
             "--seed", str(rc.seed),
             "--system-snapshot", rc.snapshot,
+            # 显式锁定 data_name = chunk=1000 规范建库（caches/neurology_chunk1000），
+            # 否则 Step_3 回退默认 pipeline_defaults.DATA_NAME="neurology"（chunk=2400 旧超图），
+            # 既会写到 judge 找不到的目录，更会用错超图导致与 r0 基线不可比。
+            "--data-name", rc.data_name,
             # 显式锁定题集文件路径（80 题 questions_v2_manual_final.jsonl），
             # 否则 Step_3 回退到 --question-stage 默认 2_stage.json（43 题旧文件），
             # 与冻结 SHA b1067566 不符会被 --expected-question-sha256 门禁拒绝。

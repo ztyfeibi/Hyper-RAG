@@ -175,6 +175,8 @@ def test_pgold_command_constraints():
     assert "--expected-question-sha256" in joined
     assert "--question-file-path" in joined, "必须显式锁定题集文件，否则 Step_3 回退到 2_stage.json"
     assert str(rrp.jl.QUESTIONS_FILE) in joined, "题集文件路径必须是冻结的 questions_v2_manual_final.jsonl"
+    assert "--data-name" in joined, "必须显式锁定 data_name，否则 Step_3 回退默认 neurology（chunk=2400 旧超图）"
+    assert rc.data_name in joined, f"data_name 必须是规范 chunk=1000 建库 {rc.data_name}"
     assert "--debug-relax-constraints" not in joined
     assert f"--repeat-id 1" in joined and "--seed 43" in joined
     assert SNAP in joined
@@ -187,6 +189,9 @@ def test_non_pgold_no_gold_context_arg():
     assert "--gold-context-file" not in " ".join(gen_p0.cmd)
     # 非 P_gold 路由也必须显式锁定题集文件（共用 80 题冻结题集）
     assert "--question-file-path" in " ".join(gen_p0.cmd)
+    # 非 P_gold 路由同样必须锁定 data_name（否则用错 chunk=2400 超图）
+    assert "--data-name" in " ".join(gen_p0.cmd)
+    assert rc.data_name in " ".join(gen_p0.cmd)
 
 
 # ---------------------------------------------------------------------------
