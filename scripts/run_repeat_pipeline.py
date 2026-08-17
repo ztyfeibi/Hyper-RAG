@@ -364,12 +364,15 @@ def _covers_routes(rc: RepeatContext, routes: list[str], path: Path) -> bool:
 
 
 def _judge_covers(rc: RepeatContext, routes: list[str]) -> bool:
-    """所有请求路线的 judge verdict 文件存在且各含 80 条 parse_ok 记录。"""
+    """所有请求路线的 judge verdict 文件存在且各含 80 条 distinct cell。
+
+    允许 parse_ok=false（确定性 judge 失败视为已完成，不再重试）。
+    """
     for r in routes:
         vf = rc.verdict_file(r)
         if not vf.exists():
             return False
-        done = jl.read_done_ok(vf)
+        done = jl.read_done_any(vf)
         if len(done) != P_GOLD_N_QUESTIONS:
             return False
     return True

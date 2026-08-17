@@ -1324,22 +1324,29 @@ def cmd_apply(args) -> int:
             print(f"  {e}", file=sys.stderr)
         return 1
 
-    # 3) 结构检查：每路径各 80、parse_ok 全 true
+    # 3) 结构检查：每路径各 80 条 distinct cell（parse_ok=false 不再 fail-closed，
+    #    而是作为一等公民的 judge_error 结果，下游记为 route_success=judge_error）。
     expected_total = 80 * len(active_routes)
     structural_errors = []
+    judge_error_cells = []
     for route in active_routes:
         route_map = longcat.get(route, {})
         if len(route_map) != 80:
             structural_errors.append(f"{route}: {len(route_map)} 条 != 80")
+            continue
         for qid, lc in route_map.items():
             if not lc.get("parse_ok"):
-                structural_errors.append(f"{route}/{qid}: parse_ok 非 true")
+                judge_error_cells.append((route, qid))
     if structural_errors:
         print(f"ERROR: LongCat 记录结构不满足 {expected_total} 条约束（fail-closed）:",
               file=sys.stderr)
         for e in structural_errors[:20]:
             print(f"  {e}", file=sys.stderr)
         return 1
+    if judge_error_cells:
+        print(f"WARN: {len(judge_error_cells)} 个 cell 的 judge 未产出有效裁决"
+              f"（parse_ok=false，确定性失败），将记为 route_success=judge_error: "
+              f"{judge_error_cells[:10]}", file=sys.stderr)
 
     # 4) 候选答案（补充审核材料用，仅旧模式队列需要）
     answers_by_route = {}
@@ -1362,6 +1369,38 @@ def cmd_apply(args) -> int:
             q = questions[qid]
             required = {u["unit_id"] for u in q.get("answer_units", [])
                         if u.get("required", True)}
+            # judge 未产出有效裁决（确定性失败，如输出撞 token 上限被截断）：
+            # 作为一等公民结果，route_success=judge_error，不进 pending / 补充审核。
+            if not lc.get("parse_ok"):
+                final_records.append({
+                    "route": route,
+                    "question_id": qid,
+                    "blind_id": (ai_r or {}).get("blind_id"),
+                    "review_source": (ai_r or {}).get("review_source"),
+                    "source": "longcat_judge_error",
+                    "answer_correctness": "judge_error",
+                    "route_success": "judge_error",
+                    "adjudication_rule_version": ADJUDICATION_RULE_VERSION,
+                    "coverage_hit": cov["coverage_hit"],
+                    "coverage_rule_version": cov["coverage_rule_version"],
+                    "no_context": cov["no_context"],
+                    "evidence_requirements_total": cov["evidence_requirements_total"],
+                    "evidence_requirements_hit": cov["evidence_requirements_hit"],
+                    "er_recall": cov["er_recall"],
+                    "coverage_details": cov["coverage_details"],
+                    "context_hash": cov["context_hash"],
+                    "required_aus": (sorted(required)
+                                     if isinstance(required, (set, list)) else list(required or [])),
+                    "has_required_contradicted": None,
+                    "has_required_missing": None,
+                    "has_fatal_claim": None,
+                    "has_unresolved_claim": None,
+                    "ai_verdict": None,
+                    "lc_verdict": None,
+                    "lc_derived_verdict": None,
+                    "judge_parse_error": True,
+                })
+                continue
             ai_input = None
             if ai_r is not None:
                 ai_input = {

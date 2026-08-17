@@ -481,7 +481,7 @@ class FileLock:
 
 
 def read_done_ok(out: Path) -> set:
-    """已成功解析的 qid（parse_failed 记录允许重跑）。"""
+    """已成功解析的 qid（parse_ok=true）。仅用于并发写入幂等守卫。"""
     if not out.exists():
         return set()
     ids = set()
@@ -495,14 +495,48 @@ def read_done_ok(out: Path) -> set:
     return ids
 
 
+def read_done_any(out: Path) -> set:
+    """已落盘任何记录的 qid（无论 parse_ok 与否）。
+
+    用于 resume 跳过判定：确定性的 parse_failed cell（如 LongCat 输出撞 token
+    上限被截断）不应在每次 resume 时被反复重跑——它必然产出同一份无效结果，
+    重试没有意义，应作为一等公民的 judge_error 结果留存。
+    """
+    if not out.exists():
+        return set()
+    ids = set()
+    for line in open(out, encoding="utf-8"):
+        try:
+            r = json.loads(line)
+            ids.add(r["question_id"])
+        except Exception:
+            continue
+    return ids
+
+
 def write_record(out: Path, qid: str, rec: dict) -> bool:
-    """锁内 '查 done_ok + 追加' 原子操作。返回是否实际写入（False=已被其他进程成功写过）。"""
+    """锁内 '查 done_ok + 同 qid 去重替换写' 原子操作。
+
+    返回是否实际写入（False=已被其他进程成功写过 parse_ok 记录）。
+    同 qid 旧记录（含 parse_failed）会被替换，避免 resume 累积重复行（#bloat 修复）。
+    """
     lock = out.with_suffix(out.suffix + ".lock")
     with FileLock(lock):
         if qid in read_done_ok(out):
             return False
-        with open(out, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        kept = []
+        if out.exists():
+            for line in open(out, encoding="utf-8"):
+                try:
+                    r = json.loads(line)
+                    if r.get("question_id") == qid:
+                        continue  # 丢弃同 qid 旧记录（含 parse_failed）
+                except Exception:
+                    pass
+                kept.append(line if line.endswith("\n") else line + "\n")
+        kept.append(json.dumps(rec, ensure_ascii=False) + "\n")
+        with open(out, "w", encoding="utf-8") as f:
+            f.writelines(kept)
         return True
 
 
@@ -629,9 +663,9 @@ def run_judge(routes, repeat, seed, snapshot, smoke, concurrency):
             continue
         answers = load_results(rf)
         out = od / f"{route}_verdict.jsonl"
-        done_ok = read_done_ok(out)
+        done_any = read_done_any(out)
         qids = [q for q in order if q in answers and q in questions and q in gold_ctx
-                and q not in done_ok]
+                and q not in done_any]
         total_planned += len(qids)
 
         def work(qid):
