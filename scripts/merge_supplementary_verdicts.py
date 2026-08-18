@@ -176,9 +176,13 @@ def merge(base_dir: Path = None, write: bool = True,
                      if r.get("route_success") == "pending" and not r.get("blind_id")}
     d_keys = {(e["route"], e["question_id"]) for e in d_meta.values()}
     if d_keys != pending_nobid:
-        errors.append(f"set_D keys != pending-no-bid keys "
-                      f"(D-only={sorted(d_keys - pending_nobid)[:3]}, "
-                      f"pending-only={sorted(pending_nobid - d_keys)[:3]})")
+        d_only = sorted(d_keys - pending_nobid)
+        p_only = sorted(pending_nobid - d_keys)
+        errors.append(
+            f"set_D keys != pending-no-bid keys "
+            f"(set_D={len(d_keys)}, pending-no-bid={len(pending_nobid)}; "
+            f"D-only={len(d_only)} 条 e.g.{d_only[:3]}, "
+            f"pending-only={len(p_only)} 条 e.g.{p_only[:3]})")
     if set(d_meta) != set(rec_d):
         errors.append(f"set_D 记录缺失: {sorted(set(d_meta) - set(rec_d))[:5]}")
     if set(e_meta) != set(rec_e):

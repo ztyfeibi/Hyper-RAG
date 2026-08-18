@@ -4,17 +4,26 @@
 P0-P4+P_gold 六路径时，原逻辑以“单文件存在”判 skip，导致 preapply/final-apply 被错误跳过，
 最终只产出 80 条而非 6×80=480。
 
-修复：合并裁决步骤（preapply/final-apply/review/merge）与 judge 的 resume 判据改为
-“产物覆盖全部请求路线”，而非单文件存在。本文件锁定该行为：
-  - 合并步骤仅覆盖部分路线时不跳过；
-  - 覆盖全部路线时（含二次 resume）跳过；
+修复：
+1) 合并裁决步骤（preapply/final-apply/merge）与 judge 的 resume 判据改为“产物覆盖全部请求路线”，
+   而非单文件存在；
+2) 盲审链（build-review/review/recheck）改用 review_id 覆盖度判据，且扩展路线时陈旧盲审产物
+   **不可静默复用**——manifest 与 preapply pending 不一致且已存在 AI 裁决时，fail-closed 拦截
+   （review_id 为序号编码，重建模板会使旧裁决错配到不同 cell，造成静默数据污染）。用户须先
+   删除 blind_review_supplementary 目录再重跑。
+
+本文件锁定该行为：
+  - 合并步骤仅覆盖部分路线时不跳过；覆盖全部路线时（含二次 resume）跳过；
   - generate[route] 每路径独立，P_gold 产物保留不重算；
   - judge 增量（per-route verdict 完整才跳过）；
-  - 扩展后最终 480 条、P_gold 记录原样保留、无重复。
+  - 扩展后最终 480 条、P_gold 记录原样保留、无重复；
+  - 扩展时若存在陈旧盲审产物（manifest 与 pending 不一致 + 已有裁决），fail-closed 拦截，
+    必须清理目录后才能重跑。
 """
 from __future__ import annotations
 
 import json
+import shutil
 import types
 from pathlib import Path
 
@@ -151,6 +160,48 @@ def _simulate_complete(step: rrp.Step, rc: _FakeRC, routes: list[str]) -> None:
     m = step.marker
     if m is not None:
         m.parent.mkdir(parents=True, exist_ok=True)
+
+        # preapply：no-annotations 初裁语义——全 pending、无 blind_id
+        if step.name == "preapply":
+            with open(m, "w", encoding="utf-8") as f:
+                for r in routes:
+                    for i in range(rrp.P_GOLD_N_QUESTIONS):
+                        f.write(json.dumps({"route": r, "question_id": f"q{i:03d}",
+                                            "route_success": "pending",
+                                            "blind_id": None}) + "\n")
+            return
+
+        # build-review：sample_manifest（dict）+ 模板，cell 集合锚定当前 preapply pending
+        if step.name == "build-review":
+            no_bid, with_bid = rrp._pending_cells(rc)
+            d_cells = sorted(no_bid)
+            rids = [f"R{rc.repeat}-D-{i + 1:03d}" for i in range(len(d_cells))]
+            obj = {
+                "source_final_verdicts": "ai_adjudication_pre/final_verdicts.jsonl",
+                "adjudication_rule_version": "v3",
+                f"set_D_unreviewed_{len(d_cells)}": [
+                    {"review_id": rid, "route": rt, "question_id": q,
+                     "blind_id": None}
+                    for rid, (rt, q) in zip(rids, d_cells)],
+                f"set_E_recheck_{len(with_bid)}": [],
+            }
+            m.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
+            sup = m.parent
+            with open(sup / "verdicts_template_D.jsonl", "w", encoding="utf-8") as f:
+                for rid in rids:
+                    f.write(json.dumps({"review_id": rid}) + "\n")
+            (sup / "verdicts_template_E.jsonl").write_text("", encoding="utf-8")
+            return
+
+        # review/recheck：盲审输出仅含 review_id（真实产物无 route 字段）
+        if step.name in ("review", "recheck"):
+            which = "D" if step.name == "review" else "E"
+            tpl = m.parent / f"verdicts_template_{which}.jsonl"
+            with open(m, "w", encoding="utf-8") as f:
+                for rid in sorted(rrp._review_ids(tpl)):
+                    f.write(json.dumps({"review_id": rid, "verdict": "pass"}) + "\n")
+            return
+
         with open(m, "w", encoding="utf-8") as f:
             for r in routes:
                 for i in range(rrp.P_GOLD_N_QUESTIONS):
@@ -193,6 +244,12 @@ def test_resume_extension_pgold_to_six(tmp_path):
                      runner=_make_runner(steps_a, rc, ["P_gold"], calls_a))
     assert calls_a, "Phase A 应实际执行步骤"
 
+    # 扩展前必须清理陈旧盲审目录（真实修复动作：用户 rm -rf blind_review_supplementary）。
+    # 否则 manifest(80-cell) 与 preapply pending(480-cell) 不一致 + 已有 AI 裁决 → fail-closed。
+    assert rc.supplementary_dir.exists(), "Phase A 应已产生盲审目录"
+    shutil.rmtree(rc.supplementary_dir, ignore_errors=True)
+    assert not rc.supplementary_dir.exists(), "扩展前须删除陈旧盲审目录"
+
     # Phase B: 六路径 + --resume（扩展）
     steps_b = rrp.build_steps(rc, SIX, rrp.QUESTIONS_SHA256)
     calls_b: list = []
@@ -230,6 +287,47 @@ def test_resume_extension_pgold_to_six(tmp_path):
     work_cmds = {tuple(s.cmd) for s in steps_b if s.name != "preflight"}
     ran_work = [c for c in calls_c if c in work_cmds]
     assert not ran_work, f"二次 resume 应全跳过工作步骤，却执行了 {len(ran_work)} 步: {[c[:3] for c in ran_work]}"
+
+
+def test_extension_fail_closed_without_clearing_stale_blind_review(tmp_path):
+    """扩展时若陈旧盲审产物未清理，必须 fail-closed 拦截（禁止静默重建/数据污染）。
+
+    复现用户事故：r2 先以 P_gold-only 产生 80-cell 盲审目录，后用 --resume 扩展到六路径，
+    preapply 重生为 480 但盲审目录残留 80 裁决。旧逻辑静默 skip build-review → review 空转
+    → merge 才爆一致性校验。新逻辑在 build-review 前 fail-closed。
+    """
+    rc = _FakeRC(tmp_path)
+
+    # Phase A: P_gold-only 全量（产生 80-cell 盲审目录 + 80 条 AI 裁决）
+    steps_a = rrp.build_steps(rc, ["P_gold"], rrp.QUESTIONS_SHA256)
+    rrp.run_pipeline(steps_a, rc, ["P_gold"], phase="all",
+                     dry_run=False, resume=False,
+                     runner=_make_runner(steps_a, rc, ["P_gold"], []))
+    assert rc.supplementary_dir.exists()
+    verdict_d = rc.supplementary_dir / "verdicts_ai_supplementary_D.jsonl"
+    assert verdict_d.exists() and verdict_d.read_text(encoding="utf-8").strip(), \
+        "Phase A 应已产出 AI 裁决"
+
+    # Phase B: 六路径 + --resume，但**未清理**盲审目录 → 必须 fail-closed（exit!=0）
+    steps_b = rrp.build_steps(rc, SIX, rrp.QUESTIONS_SHA256)
+
+    class _FailingRunner:
+        def __init__(self):
+            self.calls = []
+        def __call__(self, cmd, cwd=None):
+            self.calls.append(tuple(cmd))
+            return _RET
+
+    runner_b = _FailingRunner()
+    rc_b = rc  # 复用同一 rc（不删 supplementary_dir）
+    rc_b.repeat = 2  # 模拟 r2
+    ret = rrp.run_pipeline(steps_b, rc_b, SIX, phase="all",
+                           dry_run=False, resume=True, runner=runner_b)
+    assert ret != 0, "扩展时陈旧盲审产物未清理必须 fail-closed 拦截"
+    # 盲审步骤绝不应被静默执行（build-review 在 fail-closed 处即中止）
+    br = [s for s in steps_b if s.name == "build-review"][0]
+    assert tuple(br.cmd) not in set(runner_b.calls), \
+        "fail-closed 时 build-review 不应执行"
 
 
 # ---------------------------------------------------------------------------

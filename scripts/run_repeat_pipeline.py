@@ -378,9 +378,144 @@ def _judge_covers(rc: RepeatContext, routes: list[str]) -> bool:
     return True
 
 
+def _pending_cells(rc: RepeatContext) -> tuple[set, set]:
+    """当前 preapply 产物的 pending cell 集合，返回 (no_bid, with_bid)。
+
+    no_bid  -> 未经 AI 审核的悬置（set_D 的来源）
+    with_bid-> 已审核但 unresolved 的悬置（set_E 的来源）
+    """
+    fv = rc.judge_dir / "ai_adjudication_pre" / "final_verdicts.jsonl"
+    no_bid: set = set()
+    with_bid: set = set()
+    if not fv.exists():
+        return no_bid, with_bid
+    for line in fv.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        if r.get("route_success") != "pending":
+            continue
+        key = (r.get("route"), r.get("question_id"))
+        (with_bid if r.get("blind_id") else no_bid).add(key)
+    return no_bid, with_bid
+
+
+def _manifest_cells(rc: RepeatContext) -> tuple[set, set]:
+    """sample_manifest.json 记录的 (set_D, set_E) cell 集合。"""
+    sm = rc.judge_dir / "blind_review_supplementary" / "sample_manifest.json"
+    d_cells: set = set()
+    e_cells: set = set()
+    if not sm.exists():
+        return d_cells, e_cells
+    try:
+        obj = json.loads(sm.read_text(encoding="utf-8"))
+    except Exception:
+        return d_cells, e_cells
+    if not isinstance(obj, dict):
+        return d_cells, e_cells
+    for key, val in obj.items():
+        if not isinstance(val, list):
+            continue
+        if key.startswith("set_D_unreviewed"):
+            target = d_cells
+        elif key.startswith("set_E_recheck"):
+            target = e_cells
+        else:
+            continue
+        for e in val:
+            if isinstance(e, dict):
+                target.add((e.get("route"), e.get("question_id")))
+    return d_cells, e_cells
+
+
+def _build_review_covers(rc: RepeatContext) -> bool:
+    """sample_manifest 的 cell 集合与当前 preapply pending 一致才可跳过。
+
+    仅判断“文件存在”会在 preapply 从 P_gold-only 重生成为六路径后误跳过，
+    导致模板仍是陈旧的 80 条、review 空转、merge 一致性校验才爆。
+    """
+    no_bid, with_bid = _pending_cells(rc)
+    d_cells, e_cells = _manifest_cells(rc)
+    if not d_cells and not e_cells:
+        return False
+    return d_cells == no_bid and e_cells == with_bid
+
+
+def _review_ids(path: Path) -> set:
+    """JSONL 的 review_id 集合。不存在返回空集。"""
+    ids: set = set()
+    if not path.exists():
+        return ids
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            rid = json.loads(line).get("review_id")
+        except Exception:
+            continue
+        if rid:
+            ids.add(rid)
+    return ids
+
+
+def _review_output_covers(rc: RepeatContext, which: str) -> bool:
+    """set_D/set_E 的 AI 裁决是否覆盖对应模板的全部 review_id。
+
+    盲审输出刻意不含 route 字段（review_id 隐藏 route/qid），因此不能用路线
+    覆盖度判据——_covers_routes 对它恒为 False。以模板 review_id 为准。
+    """
+    sup = rc.judge_dir / "blind_review_supplementary"
+    tpl = sup / f"verdicts_template_{which}.jsonl"
+    out = sup / ("verdicts_ai_supplementary_D.jsonl" if which == "D"
+                 else "verdicts_ai_recheck_E.jsonl")
+    if not tpl.exists() or not out.exists():
+        return False
+    return _review_ids(tpl).issubset(_review_ids(out))
+
+
+# 盲审链步骤：执行前统一做一次陈旧产物 fail-closed 检查
+_BLIND_REVIEW_STEPS = {"build-review", "review", "recheck", "merge"}
+
+
+def stale_blind_review_problems(rc: RepeatContext) -> list[str]:
+    """陈旧盲审产物 fail-closed 检查（返回问题列表，空=通过）。
+
+    review_id 是序号编码（R{n}-D-001…），随 pending 集合的大小与排序漂移。
+    若 sample_manifest 的 cell 集合与当前 preapply pending 不一致，而目录里
+    已存在非空 AI 裁决，则重建模板会让旧 review_id 的裁决被复用到**不同
+    cell** 上（run_supplementary_review 按 review_id 断点续跑）——静默数据
+    污染。此时必须人工清理，不允许自动重建。
+    """
+    sup = rc.judge_dir / "blind_review_supplementary"
+    if not (sup / "sample_manifest.json").exists():
+        return []
+    no_bid, with_bid = _pending_cells(rc)
+    if not no_bid and not with_bid:
+        return []  # preapply 尚未产出/无 pending，交由前序步骤处理
+    d_cells, e_cells = _manifest_cells(rc)
+    if d_cells == no_bid and e_cells == with_bid:
+        return []  # 一致
+    stale = [p.name for p in (sup / "verdicts_ai_supplementary_D.jsonl",
+                              sup / "verdicts_ai_recheck_E.jsonl")
+             if p.exists() and p.stat().st_size > 0]
+    if not stale:
+        return []  # 仅 manifest 陈旧、无裁决可污染 -> 允许 build-review 重建
+    return [
+        f"sample_manifest 记录 set_D={len(d_cells)} / set_E={len(e_cells)} cell，"
+        f"当前 preapply pending 为 no-bid={len(no_bid)} / with-bid={len(with_bid)}（不一致）",
+        f"已存在 AI 裁决 {stale}；review_id 为序号编码，重建模板会使旧裁决错配到"
+        f"不同 cell（静默数据污染）",
+        f"处理：确认放弃旧盲审结果后，删除整个目录再重跑 -> {_rel(sup)}",
+    ]
+
+
 # 这些步骤的输出是“覆盖全部请求路线的合并产物”，resume 必须以路线覆盖度为判据，
 # 而非单文件存在——否则从 P_gold-only 扩展到六路径时会错误跳过，只产出 80 条。
-_ROUTE_AWARE_COMBINED = {"preapply", "final-apply", "review", "merge"}
+# 注意：review/recheck 的输出无 route 字段，不能用此判据（见 _review_output_covers）。
+_ROUTE_AWARE_COMBINED = {"preapply", "final-apply", "merge"}
 
 
 def _should_skip(step: Step, rc: RepeatContext, routes: list[str]) -> bool:
@@ -388,8 +523,10 @@ def _should_skip(step: Step, rc: RepeatContext, routes: list[str]) -> bool:
 
     - 无 marker（preflight/verify/report）：从不跳过。
     - judge：所有请求路线 verdict 完整才跳过（per-route 文件，增量可重跑）。
-    - 合并裁决步骤（preapply/final-apply/review/merge）：输出覆盖全部请求路线才跳过。
-    - 其余（generate[route] 每路径单文件 / build-review / recheck）：单文件存在即跳过。
+    - 合并裁决步骤（preapply/final-apply/merge）：输出覆盖全部请求路线才跳过。
+    - build-review：sample_manifest 的 cell 集合与当前 preapply pending 一致才跳过。
+    - review/recheck：AI 裁决覆盖模板全部 review_id 才跳过（输出无 route 字段）。
+    - 其余（generate[route] 每路径单文件）：单文件存在即跳过。
     """
     if step.marker is None:
         return False
@@ -397,6 +534,12 @@ def _should_skip(step: Step, rc: RepeatContext, routes: list[str]) -> bool:
         return _judge_covers(rc, routes)
     if step.name in _ROUTE_AWARE_COMBINED:
         return _covers_routes(rc, routes, step.marker)
+    if step.name == "build-review":
+        return _build_review_covers(rc)
+    if step.name == "review":
+        return _review_output_covers(rc, "D")
+    if step.name == "recheck":
+        return _review_output_covers(rc, "E")
     return step.marker.exists()
 
 
@@ -431,11 +574,23 @@ def run_pipeline(steps: list[Step], rc: RepeatContext, routes: list[str],
                 return 1
             continue
 
+        # 盲审链 fail-closed：preapply pending 已变但目录残留旧 AI 裁决时，
+        # 重建模板会使 review_id 序号错配到不同 cell（静默污染），必须人工清理。
+        # 置于 skip 判断之前——陈旧态不得被 resume 跳过而掩盖。
+        if step.name in _BLIND_REVIEW_STEPS:
+            stale = stale_blind_review_problems(rc)
+            if stale:
+                print(f"ERROR: 陈旧盲审产物（fail-closed，禁止静默重建）: {step.name}",
+                      file=sys.stderr)
+                for s in stale:
+                    print(f"  {s}", file=sys.stderr)
+                return 1
+
         # resume：仅当产物覆盖全部请求路线时跳过（防止 P_gold-only 扩展到六路径时
         # 错误跳过 preapply/final-apply 等合并步骤，导致最终只 80 条而非 480）。
         if resume and _should_skip(step, rc, routes):
             tag = _rel(step.marker) if step.marker else step.name
-            print(f"[skip] {step.name}: 产物已覆盖全部请求路线 {tag}")
+            print(f"[skip] {step.name}: 产物已完整（覆盖当前请求范围） {tag}")
             continue
 
         # recheck：E 材料不存在则跳过（第一次审核无 uncertain 属正常）
