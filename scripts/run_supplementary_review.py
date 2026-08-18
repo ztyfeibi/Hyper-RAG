@@ -321,28 +321,99 @@ def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _quarantine_file(set_name: str) -> Path:
+    # 与输出文件同目录（SET_OUTPUT 被测试 monkeypatch 时自动隔离到 tmp）
+    return SET_OUTPUT[set_name].parent / f"quarantined_{set_name}.jsonl"
+
+
+def load_quarantine(set_name: str) -> list:
+    p = _quarantine_file(set_name)
+    if not p.exists():
+        return []
+    out = []
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                continue
+    return out
+
+
+def save_quarantine(set_name: str, entries: list) -> None:
+    p = _quarantine_file(set_name)
+    if entries:
+        p.write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in entries)
+                     + "\n", encoding="utf-8")
+    else:
+        p.unlink(missing_ok=True)
+
+
 def run_set(set_name: str, limit=None, parse_retry=DEFAULT_PARSE_RETRY,
             dry_run=False):
     if set_name not in SET_MD:
         print(f"[set {set_name}] 材料不存在（可能无 uncertain 需复核），跳过")
-        return {"done": 0, "skipped": 0, "todo": 0}
+        return {"done": 0, "skipped": 0, "todo": 0, "quarantined": 0}
     guide = (SUP_DIR / "REVIEW_GUIDE.md").read_text(encoding="utf-8")
     sections = split_md_sections((SET_MD[set_name]).read_text(encoding="utf-8"))
     templates = load_templates(set_name)
+    by_rid = {t["review_id"]: t for t in templates}
     existing = load_existing(set_name)
 
-    todo = [t for t in templates if t["review_id"] not in existing]
+    def au_ids_for(rid):
+        return extract_au_ids(sections.get(rid, ""))
+
+    def claim_ids_for(rid):
+        prefilled = (by_rid.get(rid) or {}).get("unsupported_claims") or []
+        return [f"C{k}" for k in range(1, len(prefilled) + 1)]
+
+    # 应用历史 quarantine 中已被人工 corrected 的记录（不再调 LLM，避免确定性重试死循环）
+    quarantine = load_quarantine(set_name)
+    still_bad = []
+    applied_overrides = []
+    for e in quarantine:
+        rid = e.get("review_id")
+        if not e.get("corrected") or rid not in by_rid:
+            still_bad.append(e)  # 未修正 / rid 不在模板 -> 本轮重试 LLM
+            continue
+        raw = e.get("last_raw")
+        try:
+            cand = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            cand = None
+        if not isinstance(cand, dict) or cand.get("review_id") != rid:
+            still_bad.append(e)
+            continue
+        errs = validate_record(cand, by_rid[rid], au_ids_for(rid), claim_ids_for(rid))
+        if errs:
+            print(f"  [override {rid}] corrected 仍不合格: {errs[:2]}"
+                  f"（本轮重试 LLM）", flush=True)
+            still_bad.append(e)
+        else:
+            applied_overrides.append((rid, normalize_record(cand, by_rid[rid])))
+
+    todo = [t for t in templates if t["review_id"] not in existing
+            and t["review_id"] not in {r for r, _ in applied_overrides}]
     if limit is not None:
         todo = todo[:limit]
     print(f"[set {set_name}] 模板 {len(templates)} 条, 已完成 {len(existing)}, "
           f"待跑 {len(todo)}" + (f"（limit={limit}）" if limit is not None else ""))
     if dry_run:
-        return {"done": 0, "skipped": len(existing), "todo": len(todo)}
+        return {"done": 0, "skipped": len(existing), "todo": len(todo), "quarantined": 0}
 
     stats = {"api_attempts": 0, "parse_retries": 0, "done": 0,
-             "skipped": len(existing)}
+             "skipped": len(existing), "quarantined": 0}
     t0 = time.time()
     with open(SET_OUTPUT[set_name], "a", encoding="utf-8") as fout:
+        # 先落盘 applied overrides（不调 LLM）
+        for rid, rec in applied_overrides:
+            fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            fout.flush()
+            stats["done"] += 1
+            print(f"  [override {rid}] 采用 quarantine 中 corrected 记录"
+                  f"（未调 LLM）", flush=True)
+
         for i, tpl in enumerate(todo, 1):
             rid = tpl["review_id"]
             section = sections[rid]
@@ -356,7 +427,7 @@ def run_set(set_name: str, limit=None, parse_retry=DEFAULT_PARSE_RETRY,
                 rid=rid, c1=claim_ids[0] if claim_ids else "C1",
                 c2=claim_ids[1] if len(claim_ids) > 1 else "C2")
 
-            rec, errs = None, []
+            rec, errs, raw = None, [], None
             for attempt in range(1, parse_retry + 1):
                 stats["api_attempts"] += 1
                 raw = llm_call(prompt, guide)
@@ -373,7 +444,12 @@ def run_set(set_name: str, limit=None, parse_retry=DEFAULT_PARSE_RETRY,
                 stats["parse_retries"] += 1
                 print(f"  [{rid}] 尝试 {attempt} 不合格: {errs[:2]}", flush=True)
             if rec is None:
-                raise SystemExit(f"[{rid}] {parse_retry} 次尝试后仍不合格: {errs}")
+                # 隔离续跑：不中止整条流水线，记录原始输出+错误，继续下一题
+                still_bad.append({"review_id": rid, "errors": errs, "last_raw": raw})
+                stats["quarantined"] += 1
+                print(f"  [WARN] [{rid}] {parse_retry} 次尝试后仍不合格，已隔离"
+                      f"（见 {_quarantine_file(set_name).name}），继续下一题", flush=True)
+                continue
 
             fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
             fout.flush()
@@ -382,6 +458,16 @@ def run_set(set_name: str, limit=None, parse_retry=DEFAULT_PARSE_RETRY,
                 el = time.time() - t0
                 print(f"[set {set_name}] {i}/{len(todo)} 完成 "
                       f"({el:.0f}s, 均 {el / i:.1f}s/条)", flush=True)
+
+    if still_bad:
+        save_quarantine(set_name, still_bad)
+        print(f"[WARN] set {set_name}: {len(still_bad)} 条隔离"
+              f"（见 {_quarantine_file(set_name).name}），review 未完整；"
+              f"修复方式：①编辑该记录把 au_status 等改对后加 \"corrected\": true 重跑本步骤，"
+              f"或 ②按材料手动定该 cell 正确判定后追加到 {SET_OUTPUT[set_name].name} 再重跑",
+              flush=True)
+        raise SystemExit(2)
+    save_quarantine(set_name, [])  # 无隔离则清理文件
     return stats
 
 

@@ -240,6 +240,60 @@ class TestRunSet:
         assert len(rows) == 12
         assert {r["review_id"] for r in rows} == {t["review_id"] for t in materials["e_tpl"]}
 
+    def test_quarantine_writes_and_continues(self, isolate_output, monkeypatch, materials):
+        """顽固 cell 不中止流水线：好 cell 全写出，坏 cell 隔离到同目录文件，末道 raise(2)。"""
+        target = materials["e_tpl"][0]["review_id"]
+        base = _fake_llm_ok(materials)
+        re = __import__("re")
+
+        def flaky(prompt, system_prompt):
+            rid = re.search(r"### (SR-[DE]-\d{3})", prompt).group(1)
+            if rid == target:
+                return "bad"  # 确定性不合格
+            return base(prompt, system_prompt)
+
+        monkeypatch.setattr(rsr, "llm_call", flaky)
+        with pytest.raises(SystemExit) as exc:
+            rsr.run_set("E")  # 12 条中 1 条坏
+        assert exc.value.code == 2
+        rows = [json.loads(l) for l in open(isolate_output["E"], encoding="utf-8") if l.strip()]
+        assert len(rows) == 11
+        assert {r["review_id"] for r in rows} == \
+            {t["review_id"] for t in materials["e_tpl"]} - {target}
+        qf = isolate_output["E"].parent / "quarantined_E.jsonl"
+        assert qf.exists(), "隔离文件应生成"
+        q = [json.loads(l) for l in open(qf, encoding="utf-8") if l.strip()]
+        assert len(q) == 1 and q[0]["review_id"] == target and q[0]["last_raw"] == "bad"
+
+    def test_quarantine_override_applied_without_llm(self, isolate_output, monkeypatch, materials):
+        """quarantine 中标 corrected:true 的记录直接采用、不调 LLM，且隔离文件清理。"""
+        target = materials["e_tpl"][0]["review_id"]
+        au = rsr.extract_au_ids(materials["e_sections"][target])
+        corrected = _valid_record(materials["e_tpl"][0], au)
+        corrected["au_status"][au[0]] = "contradicted"  # 改值以示区别
+        qf = isolate_output["E"].parent / "quarantined_E.jsonl"
+        qf.write_text(json.dumps({"review_id": target, "errors": ["x"],
+                                  "last_raw": json.dumps(corrected, ensure_ascii=False),
+                                  "corrected": True}, ensure_ascii=False) + "\n",
+                      encoding="utf-8")
+        base = _fake_llm_ok(materials)
+        re = __import__("re")
+        calls = {"n": 0}
+
+        def fake(prompt, system_prompt):
+            calls["n"] += 1
+            rid = re.search(r"### (SR-[DE]-\d{3})", prompt).group(1)
+            assert rid != target, "override 不该再调 LLM"
+            return base(prompt, system_prompt)
+
+        monkeypatch.setattr(rsr, "llm_call", fake)
+        stats = rsr.run_set("E")  # 不应 raise
+        assert stats["done"] == 12
+        rows = {r["review_id"]: r for r in
+                (json.loads(l) for l in open(isolate_output["E"], encoding="utf-8") if l.strip())}
+        assert rows[target]["au_status"][au[0]] == "contradicted"
+        assert not qf.exists(), "已应用后隔离文件应清理"
+
 
 class TestMetadata:
     def test_write_metadata_fields(self, tmp_path, monkeypatch, materials):
